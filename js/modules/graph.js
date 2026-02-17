@@ -6,12 +6,32 @@ import { appSettings } from '../core/store.js';
 let graphSimulation = null;
 let graphSvg = null;
 let graphZoom = null;
+let graphCurrentTransform = { x: 0, y: 0, k: 1 };
+let graphNodeSelection = null;
+let graphLinkSelection = null;
+let graphContainerEl = null;
 let processedNodes = [];
 let processedLinks = []; 
 let activeNodeId = null; 
 let isDragging = false;  
 let wasActiveBeforeDrag = false;
 let currentViewMode = 'graph'; 
+let graphResizeBound = false;
+const DEFAULT_GRAPH_SCALE = 1.25;
+
+function applyGraphLayoutFrame() {
+    if (!graphNodeSelection || !graphLinkSelection) return;
+
+    graphLinkSelection.attr("d", (d) => {
+        if (!Number.isFinite(d.source?.x) || !Number.isFinite(d.target?.x)) return "";
+        return `M${d.source.x},${d.source.y} L${d.target.x},${d.target.y}`;
+    });
+
+    graphNodeSelection.attr("transform", (d) => {
+        if (!Number.isFinite(d.x) || !Number.isFinite(d.y)) return "";
+        return `translate(${d.x},${d.y})`;
+    });
+}
 
 function stripWhenAndInvolving(raw = '') {
     return String(raw || '')
@@ -114,6 +134,20 @@ export function initGraphPage() {
         
         document.getElementById('entity-sidebar-search').oninput = (e) => filterEntityList(e.target.value);
     }
+
+    if (!graphResizeBound) {
+        let resizeTimer = null;
+        window.addEventListener('resize', () => {
+            if (resizeTimer) clearTimeout(resizeTimer);
+            resizeTimer = setTimeout(() => {
+                const graphPage = document.getElementById('graph-page');
+                if (!graphPage || !graphPage.classList.contains('active-page')) return;
+                if (currentViewMode !== 'graph') return;
+                renderGraphView();
+            }, 120);
+        });
+        graphResizeBound = true;
+    }
     
     renderGraphView();
 }
@@ -125,11 +159,12 @@ function resetGraphZoom() {
         const container = document.getElementById('graph-container');
         const width = container.clientWidth;
         const height = container.clientHeight;
-        const scale = 1.5;
+        const scale = DEFAULT_GRAPH_SCALE;
         const tx = (width / 2) * (1 - scale);
         const ty = (height / 2) * (1 - scale);
         const transform = d3.zoomIdentity.translate(tx, ty).scale(scale);
 
+        graphCurrentTransform = transform;
         graphSvg.transition().duration(750).call(graphZoom.transform, transform);
     }
 }
@@ -153,6 +188,7 @@ export async function refreshGraphData() {
 // --- Data Fetch & Render ---
 async function renderGraphView() {
     const container = document.getElementById('graph-container');
+    graphContainerEl = container;
     const entitySidebarList = document.getElementById('entity-list-content');
     
     // Call Hindsight Service
@@ -251,10 +287,17 @@ async function renderGraphView() {
     container.innerHTML = ''; 
     const width = container.clientWidth;
     const height = container.clientHeight;
+    let g = null;
 
     if (graphSimulation) graphSimulation.stop();
 
-    graphZoom = d3.zoom().scaleExtent([0.1, 4]).on("zoom", (e) => g.attr("transform", e.transform));
+    graphZoom = d3.zoom()
+        .scaleExtent([0.1, 4])
+        .on("zoom", (e) => {
+            graphCurrentTransform = e.transform;
+            if (g) g.attr("transform", e.transform);
+            applyGraphLayoutFrame();
+        });
     
     graphSvg = d3.select("#graph-container").append("svg")
         .attr("width", width).attr("height", height)
@@ -265,11 +308,15 @@ async function renderGraphView() {
         if (event.target.tagName === 'svg') closeDetailPanel();
     });
 
-    const g = graphSvg.append("g");
+    g = graphSvg.append("g");
 
     // Initial Zoom
-    const initScale = 1.5;
-    graphSvg.call(graphZoom.transform, d3.zoomIdentity.translate((width/2)*(1-initScale), (height/2)*(1-initScale)).scale(initScale));
+    const initScale = DEFAULT_GRAPH_SCALE;
+    const initialTransform = d3.zoomIdentity
+        .translate((width / 2) * (1 - initScale), (height / 2) * (1 - initScale))
+        .scale(initScale);
+    graphCurrentTransform = initialTransform;
+    graphSvg.call(graphZoom.transform, initialTransform);
 
     const spacing = getSpacingFactors();
 
@@ -305,6 +352,9 @@ async function renderGraphView() {
             showNodeDetails(d);
         });
 
+    graphLinkSelection = link;
+    graphNodeSelection = node;
+
     node.append("circle")
         .attr("r", d => d.r).attr("fill", d => d.color).attr("stroke", "none");
 
@@ -312,22 +362,11 @@ async function renderGraphView() {
         .text(d => d.label)
         .attr("fill", "#888") 
         .style("font-size", "4px") 
-        .style("font-family", "'Roboto Mono', monospace")
+        .style("font-family", "var(--font-mono)")
         .style("pointer-events", "none").style("text-transform", "uppercase");
 
-    graphSimulation.on("tick", () => {
-        link.attr("d", d => {
-            if (isNaN(d.source.x) || isNaN(d.target.x)) return "";
-            return `M${d.source.x},${d.source.y} L${d.target.x},${d.target.y}`;
-        });
-        node.attr("transform", d => {
-            if (isNaN(d.x)) return "";
-            const padding = 24;
-            d.x = Math.max(padding, Math.min(width - padding, d.x));
-            d.y = Math.max(padding, Math.min(height - padding, d.y));
-            return `translate(${d.x},${d.y})`;
-        });
-    });
+    graphSimulation.on("tick", () => applyGraphLayoutFrame());
+    applyGraphLayoutFrame();
 }
 
 // --- Interaction Helpers ---
@@ -407,6 +446,7 @@ function switchGraphView(mode) {
         if(sidebar) sidebar.style.display = 'flex'; 
         if(resetBtn) resetBtn.style.display = 'flex'; 
         if(graphSimulation) graphSimulation.alpha(0.3).restart();
+        applyGraphLayoutFrame();
     } else {
         if(resetBtn) resetBtn.style.display = 'none'; 
         if(timelineEl) { timelineEl.style.display = 'block'; renderTimelineView(); }
@@ -449,7 +489,7 @@ function renderTimelineView() {
             <div class="timeline-dot" style="border-color:${d.color}; box-shadow:0 0 5px ${d.color}"></div>
             <div class="timeline-card" style="border-color:${d.color}44">
                 <div class="timeline-date-sub">${d.date ? d.date.substring(0,10) : "Unknown Date"}</div>
-                <div style="font-size:0.9em; line-height:1.6; color:#ccc; font-family:'Roboto Mono', monospace">${textContent}</div>
+                <div style="font-size:0.9em; line-height:1.6; color:#ccc; font-family:var(--font-mono)">${textContent}</div>
                 <div style="margin-top:12px; display:flex; gap:6px; flex-wrap:wrap">${tagsHtml}</div>
             </div>
         </div>`;
@@ -488,6 +528,10 @@ function showNodeDetails(d) {
     if(currentViewMode === 'graph') applySelectionState(activeNodeId);
 
     panel.classList.add('open');
+    if (currentViewMode === 'graph') {
+        applyGraphLayoutFrame();
+        if (graphSimulation) graphSimulation.alpha(0.16).restart();
+    }
     document.getElementById('detail-type').innerText = d.type;
     const panelColor = d.color || COLORS.node;
     panel.style.borderLeftColor = panelColor;
@@ -500,7 +544,7 @@ function showNodeDetails(d) {
         <div class="detail-content">${contentHtml}</div>
         
         <div class="detail-header" style="color:${panelColor}">Metadata</div>
-        <div class="detail-meta" style="font-size:0.75em; color:#555; font-family:'Roboto Mono', monospace; margin-bottom: 20px;">
+        <div class="detail-meta" style="font-size:0.75em; color:#555; font-family:var(--font-mono); margin-bottom: 20px;">
             <div style="margin-bottom: 8px;">ID: <span style="color:${panelColor}">${d.id.substring(0,8)}</span>...</div>
             <div>TAGS: <span style="color:${panelColor}">${d.entities || "N/A"}</span></div>
         </div>
@@ -530,7 +574,11 @@ function closeDetailPanel() {
     const panel = document.getElementById('graph-details-panel');
     if(panel) panel.classList.remove('open'); 
     activeNodeId = null; 
-    if(currentViewMode === 'graph') resetHighlight(); 
+    if(currentViewMode === 'graph') {
+        resetHighlight();
+        applyGraphLayoutFrame();
+        if (graphSimulation) graphSimulation.alpha(0.12).restart();
+    }
 }
 
 function applySelectionState(selectedId) {

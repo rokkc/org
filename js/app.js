@@ -407,7 +407,7 @@ window.loadItemIntoEditor = function(id) {
         }
     }
 
-    if (!item) return;
+    if (!item) return false;
 
     if (foundSection !== activeSection) {
         const tab = Array.from(document.querySelectorAll('.tab-btn')).find((b) => b.innerText === foundSection);
@@ -437,6 +437,8 @@ window.loadItemIntoEditor = function(id) {
         document.getElementById('edit-title-input').value = item.title || "";
         quill.root.innerHTML = item.body || item.details || item.notes || '';
     }
+
+    return true;
 };
 
 function setupFormFields() {

@@ -1,9 +1,14 @@
 import asyncio
+import hashlib
 import json
 import os
 import re
+import sqlite3
+import threading
+import uuid
 from contextlib import asynccontextmanager
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
+from difflib import SequenceMatcher
 from typing import Any, AsyncIterator, Dict, List, Optional
 
 import httpx
@@ -27,6 +32,7 @@ MODEL_NAME = os.getenv("LLM_MODEL", "gpt-4o")
 http_client: Optional[httpx.AsyncClient] = None
 openai_client: Optional[AsyncOpenAI] = None
 sessions: Dict[str, List[dict]] = {}
+insight_db_lock = threading.Lock()
 
 
 @asynccontextmanager
@@ -34,6 +40,7 @@ async def lifespan(app: FastAPI):
     global http_client, openai_client
     http_client = httpx.AsyncClient(timeout=60.0)
     openai_client = AsyncOpenAI(api_key=os.getenv("OPENAI_API_KEY"))
+    init_insight_db()
     print(f"--- SYSTEM ONLINE: Async Hindsight Agent ({HINDSIGHT_URL}) ---")
     yield
     if http_client:
@@ -52,6 +59,14 @@ app.add_middleware(
 )
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+INSIGHTS_DB_PATH = os.path.join(BASE_DIR, "insights.sqlite3")
+INSIGHT_SCAN_COOLDOWN_SECONDS = 25 * 60
+INSIGHT_ERROR_RETRY_SECONDS = 60
+INSIGHT_NOVELTY_THRESHOLD = 0.86
+INSIGHT_MAX_ENTRIES = 420
+INSIGHT_STALE_DUE_GRACE_DAYS = 2
+INSIGHT_MAX_ACTIVE_FRESHNESS_DAYS = 240
+
 app.mount("/js", StaticFiles(directory=os.path.join(BASE_DIR, "js")), name="js")
 app.mount("/css", StaticFiles(directory=os.path.join(BASE_DIR, "css")), name="css")
 
@@ -69,6 +84,14 @@ class DeepInsightsRequest(BaseModel):
     max_items: int = 6
     reasoning_budget: str = "mid"
     use_reflect: bool = True
+
+
+class InsightPipelineRequest(BaseModel):
+    data: Dict[str, Any] = Field(default_factory=dict)
+    max_items: int = 8
+    reasoning_budget: str = "mid"
+    use_reflect: bool = True
+    force: bool = False
 
 
 def stream_line(payload: dict) -> str:
@@ -157,6 +180,293 @@ def sanitize_tag_list(tags: Any) -> List[str]:
 
     return out
 
+
+def utc_now_iso() -> str:
+    return datetime.now(timezone.utc).isoformat()
+
+
+def get_insight_conn() -> sqlite3.Connection:
+    conn = sqlite3.connect(INSIGHTS_DB_PATH, check_same_thread=False)
+    conn.row_factory = sqlite3.Row
+    return conn
+
+
+def init_insight_db() -> None:
+    with insight_db_lock:
+        conn = get_insight_conn()
+        conn.executescript(
+            """
+            CREATE TABLE IF NOT EXISTS insights_canonical (
+                canonical_id TEXT PRIMARY KEY,
+                dedupe_key TEXT NOT NULL UNIQUE,
+                signature TEXT NOT NULL,
+                title TEXT NOT NULL,
+                summary TEXT NOT NULL,
+                kind TEXT NOT NULL,
+                confidence REAL NOT NULL,
+                freshness_days INTEGER,
+                priority INTEGER NOT NULL,
+                valid_to TEXT,
+                due_date TEXT,
+                why_text TEXT,
+                action_json TEXT,
+                evidence_json TEXT,
+                source_type TEXT NOT NULL,
+                status TEXT NOT NULL DEFAULT 'active',
+                first_seen_at TEXT NOT NULL,
+                last_seen_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                reinforcement_count INTEGER NOT NULL DEFAULT 0
+            );
+
+            CREATE TABLE IF NOT EXISTS insight_events (
+                event_id TEXT PRIMARY KEY,
+                canonical_id TEXT NOT NULL,
+                event_type TEXT NOT NULL,
+                observed_at TEXT NOT NULL,
+                novelty_score REAL,
+                payload_json TEXT,
+                FOREIGN KEY(canonical_id) REFERENCES insights_canonical(canonical_id)
+            );
+
+            CREATE TABLE IF NOT EXISTS insight_scan_state (
+                key TEXT PRIMARY KEY,
+                value TEXT NOT NULL
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_insights_status_last_seen
+                ON insights_canonical(status, last_seen_at DESC);
+            CREATE INDEX IF NOT EXISTS idx_insights_source_kind
+                ON insights_canonical(source_type, kind);
+            CREATE INDEX IF NOT EXISTS idx_events_observed
+                ON insight_events(observed_at DESC);
+            """
+        )
+        conn.commit()
+        conn.close()
+
+
+def read_scan_state(conn: sqlite3.Connection) -> Dict[str, str]:
+    rows = conn.execute("SELECT key, value FROM insight_scan_state").fetchall()
+    state: Dict[str, str] = {}
+    for row in rows:
+        state[str(row["key"])] = str(row["value"])
+    return state
+
+
+def write_scan_state(conn: sqlite3.Connection, values: Dict[str, str]) -> None:
+    for key, value in values.items():
+        conn.execute(
+            """
+            INSERT INTO insight_scan_state(key, value)
+            VALUES(?, ?)
+            ON CONFLICT(key) DO UPDATE SET value=excluded.value
+            """,
+            (str(key), str(value)),
+        )
+
+
+def slugify(value: str) -> str:
+    clean = re.sub(r"[^a-z0-9]+", "-", str(value or "").strip().lower())
+    clean = re.sub(r"-{2,}", "-", clean).strip("-")
+    return clean[:100]
+
+
+def normalize_text_for_similarity(value: str) -> str:
+    text = clean_hindsight_text(strip_html(value)).lower()
+    text = re.sub(r"[^a-z0-9\s]+", " ", text)
+    text = re.sub(r"\s+", " ", text).strip()
+    return text[:2000]
+
+
+def token_jaccard(a: str, b: str) -> float:
+    set_a = {token for token in a.split(" ") if token}
+    set_b = {token for token in b.split(" ") if token}
+    if not set_a or not set_b:
+        return 0.0
+    union = set_a | set_b
+    if not union:
+        return 0.0
+    return len(set_a & set_b) / len(union)
+
+
+def similarity_score(a: str, b: str) -> float:
+    if not a or not b:
+        return 0.0
+    ratio = SequenceMatcher(None, a, b).ratio()
+    jaccard = token_jaccard(a, b)
+    blended = (ratio * 0.68) + (jaccard * 0.32)
+    prefix_boost = 0.0
+    if a[:64] and b[:64] and a[:64] == b[:64]:
+        prefix_boost = 0.08
+    return min(1.0, max(ratio, blended) + prefix_boost)
+
+
+def coerce_int(value: Any, default: Optional[int] = None) -> Optional[int]:
+    try:
+        if value is None or value == "":
+            return default
+        return int(value)
+    except Exception:
+        return default
+
+
+def parse_json_field(raw: Any, default: Any) -> Any:
+    if raw is None:
+        return default
+    if isinstance(raw, (dict, list)):
+        return raw
+    try:
+        return json.loads(str(raw))
+    except Exception:
+        return default
+
+
+def build_pipeline_fingerprint(data: Dict[str, Any]) -> str:
+    digest = build_data_digest(data)
+    payload = json.dumps(digest, sort_keys=True, ensure_ascii=False)
+    return hashlib.sha1(payload.encode("utf-8")).hexdigest()
+
+
+def build_insight_dedupe_key(item: Dict[str, Any]) -> str:
+    action = item.get("action") if isinstance(item.get("action"), dict) else {}
+    evidence = item.get("evidence") if isinstance(item.get("evidence"), list) else []
+    evidence_key = "|".join(
+        f"{str(ev.get('sourceSection') or '').lower()}:{str(ev.get('sourceId') or '').lower()}"
+        for ev in evidence[:2]
+        if isinstance(ev, dict)
+    )
+    return "|".join(
+        [
+            slugify(item.get("kind") or "deep"),
+            slugify(strip_html(item.get("title") or "")),
+            slugify(strip_html(item.get("summary") or "")),
+            f"{str(action.get('sourceSection') or '').lower()}:{str(action.get('sourceId') or '').lower()}",
+            evidence_key,
+        ]
+    )[:500]
+
+
+def build_insight_signature(item: Dict[str, Any]) -> str:
+    base = " ".join(
+        [
+            str(item.get("kind") or ""),
+            str(item.get("title") or ""),
+            str(item.get("summary") or ""),
+            str(item.get("why") or ""),
+        ]
+    )
+    return normalize_text_for_similarity(base)
+
+
+def normalize_pipeline_item(raw_item: Dict[str, Any], source_type: str = "deep") -> Optional[Dict[str, Any]]:
+    if not isinstance(raw_item, dict):
+        return None
+
+    title = truncate_text(str(raw_item.get("title") or ""), 190)
+    summary = truncate_text(str(raw_item.get("summary") or raw_item.get("description") or ""), 500)
+    if not title or not summary:
+        return None
+
+    kind = str(raw_item.get("kind") or "deep").strip().lower()
+    if kind not in {"deep", "now", "connections", "risks", "time", "watchlist"}:
+        kind = "deep"
+
+    evidence = raw_item.get("evidence") if isinstance(raw_item.get("evidence"), list) else []
+    normalized_evidence = []
+    for idx, entry in enumerate(evidence[:5]):
+        if not isinstance(entry, dict):
+            continue
+        normalized_evidence.append(
+            {
+                "label": str(entry.get("label") or f"Evidence {idx + 1}")[:120],
+                "sourceSection": normalize_section_name(entry.get("sourceSection") or entry.get("source_section") or ""),
+                "sourceId": str(entry.get("sourceId") or entry.get("source_id") or "")[:120],
+                "timestamp": str(entry.get("timestamp") or "")[:40],
+                "snippet": truncate_text(str(entry.get("snippet") or ""), 420),
+            }
+        )
+
+    freshness_days = coerce_int(raw_item.get("freshnessDays", raw_item.get("freshness_days")), None)
+    if normalized_evidence:
+        now_utc = datetime.now(timezone.utc)
+        inferred_ages: List[int] = []
+        for entry in normalized_evidence:
+            ts = parse_datetime(entry.get("timestamp") or "")
+            if not ts:
+                continue
+            inferred_ages.append(max(0, int((now_utc - ts).total_seconds() // 86400)))
+
+        if inferred_ages:
+            inferred_freshness = min(inferred_ages)
+            if freshness_days is None:
+                freshness_days = inferred_freshness
+            else:
+                # Never allow "freshness" to appear newer than the freshest timestamped evidence.
+                freshness_days = max(freshness_days, inferred_freshness)
+
+    action_raw = raw_item.get("action") if isinstance(raw_item.get("action"), dict) else None
+    action = None
+    if action_raw:
+        section = normalize_section_name(action_raw.get("sourceSection") or action_raw.get("source_section") or "")
+        source_id = str(action_raw.get("sourceId") or action_raw.get("source_id") or "")[:120]
+        if section and source_id:
+            action = {
+                "label": str(action_raw.get("label") or "Open Source")[:60],
+                "sourceSection": section,
+                "sourceId": source_id,
+            }
+
+    try:
+        confidence = float(raw_item.get("confidence", 0.66))
+    except Exception:
+        confidence = 0.66
+
+    insight = {
+        "id": str(raw_item.get("id") or f"insight-{uuid.uuid4().hex[:10]}")[:120],
+        "title": title,
+        "summary": summary,
+        "kind": kind,
+        "confidence": clamp(confidence, 0.25, 0.99),
+        "freshnessDays": freshness_days,
+        "evidence": normalized_evidence,
+        "why": truncate_text(str(raw_item.get("why") or raw_item.get("rationale") or ""), 1200),
+        "action": action,
+        "secondaryAction": None,
+        "priority": max(30, min(coerce_int(raw_item.get("priority"), 78) or 78, 99)),
+        "validTo": str(raw_item.get("validTo") or raw_item.get("valid_to") or "")[:40] or None,
+        "dueDate": str(raw_item.get("dueDate") or raw_item.get("due_date") or "")[:40] or None,
+        "sourceType": source_type,
+        "status": "active",
+    }
+    insight["dedupeKey"] = str(raw_item.get("dedupeKey") or build_insight_dedupe_key(insight))[:500]
+    insight["signature"] = build_insight_signature(insight)
+    return insight
+
+
+def serialize_db_entry(row: sqlite3.Row) -> Dict[str, Any]:
+    return {
+        "id": str(row["canonical_id"]),
+        "title": str(row["title"]),
+        "summary": str(row["summary"]),
+        "kind": str(row["kind"]),
+        "confidence": float(row["confidence"]),
+        "freshnessDays": coerce_int(row["freshness_days"], None),
+        "evidence": parse_json_field(row["evidence_json"], []),
+        "why": str(row["why_text"] or ""),
+        "action": parse_json_field(row["action_json"], None),
+        "secondaryAction": None,
+        "priority": coerce_int(row["priority"], 78) or 78,
+        "validTo": str(row["valid_to"] or "") or None,
+        "dueDate": str(row["due_date"] or "") or None,
+        "sourceType": str(row["source_type"] or "deep"),
+        "status": str(row["status"] or "active"),
+        "dedupeKey": str(row["dedupe_key"] or ""),
+        "firstSeenAt": str(row["first_seen_at"] or ""),
+        "lastSeenAt": str(row["last_seen_at"] or ""),
+        "lastUpdatedAt": str(row["updated_at"] or ""),
+        "reinforcementCount": coerce_int(row["reinforcement_count"], 0) or 0,
+    }
 
 def build_data_digest(data: Dict[str, Any]) -> Dict[str, Any]:
     safe = data if isinstance(data, dict) else {}
@@ -260,6 +570,7 @@ def normalize_deep_insights(items: Any, data: Dict[str, Any], max_items: int) ->
         "Groups": {str(g.get("id", "")) for g in (data.get("Groups") or []) if isinstance(g, dict)},
         "Notes": {str(n.get("id", "")) for n in (data.get("Notes") or []) if isinstance(n, dict)},
     }
+    action_candidates = build_action_candidates(data)
 
     normalized: List[dict] = []
     seen_titles = set()
@@ -312,6 +623,25 @@ def normalize_deep_insights(items: Any, data: Dict[str, Any], max_items: int) ->
                 source_id = str(entry.get("sourceId") or entry.get("source_id") or "").strip()
                 if source_section and source_id and source_id not in section_ids.get(source_section, set()):
                     source_id = ""
+
+                if not source_id:
+                    evidence_hint = " ".join(
+                        [
+                            str(entry.get("label") or ""),
+                            str(entry.get("snippet") or ""),
+                            title,
+                            summary,
+                        ]
+                    )
+                    resolved = pick_action_for_text(evidence_hint, action_candidates, section_hint=source_section)
+                    if resolved:
+                        if not source_section:
+                            source_section = normalize_section_name(resolved.get("sourceSection"))
+                        source_id = str(resolved.get("sourceId") or "").strip()
+
+                if source_section and source_id and source_id not in section_ids.get(source_section, set()):
+                    source_id = ""
+
                 evidence_entries.append(
                     {
                         "label": str(entry.get("label", "Evidence"))[:120],
@@ -328,11 +658,29 @@ def normalize_deep_insights(items: Any, data: Dict[str, Any], max_items: int) ->
         if source_section and source_id and source_id not in section_ids.get(source_section, set()):
             source_id = ""
 
+        if not source_id:
+            action_hint = " ".join(
+                [
+                    str(action.get("label") or ""),
+                    title,
+                    summary,
+                    str(item.get("why") or item.get("rationale") or ""),
+                ]
+            )
+            resolved_action = pick_action_for_text(action_hint, action_candidates, section_hint=source_section)
+            if resolved_action:
+                if not source_section:
+                    source_section = normalize_section_name(resolved_action.get("sourceSection"))
+                source_id = str(resolved_action.get("sourceId") or "").strip()
+
         if not (source_section and source_id):
             fallback = next((entry for entry in evidence_entries if entry.get("sourceSection") and entry.get("sourceId")), None)
             if fallback:
                 source_section = fallback["sourceSection"]
                 source_id = fallback["sourceId"]
+
+        if source_section and source_id and source_id not in section_ids.get(source_section, set()):
+            source_id = ""
 
         normalized.append(
             {
@@ -391,6 +739,144 @@ def parse_datetime(raw: str) -> Optional[datetime]:
     except ValueError:
         return None
     return dt if dt.tzinfo else dt.replace(tzinfo=timezone.utc)
+
+
+def to_date_only(value: datetime) -> datetime:
+    return datetime(value.year, value.month, value.day, tzinfo=timezone.utc)
+
+
+def days_between_dates(newer_date: datetime, older_date: datetime) -> int:
+    return int((to_date_only(newer_date) - to_date_only(older_date)).days)
+
+
+def parse_birthday_for_current_cycle(raw: str, now: datetime) -> Optional[datetime]:
+    match = re.match(r"^(\d{4})-(\d{2})-(\d{2})$", str(raw or "").strip())
+    if not match:
+        return None
+
+    month = int(match.group(2))
+    day = int(match.group(3))
+    if month < 1 or month > 12 or day < 1 or day > 31:
+        return None
+
+    year = now.year
+    try:
+        birthday = datetime(year, month, day, tzinfo=timezone.utc)
+    except ValueError:
+        return None
+
+    if to_date_only(birthday) < to_date_only(now):
+        try:
+            birthday = datetime(year + 1, month, day, tzinfo=timezone.utc)
+        except ValueError:
+            return None
+    return birthday
+
+
+def get_person_display_name(person: Dict[str, Any]) -> str:
+    first = str(person.get("firstName") or "").strip()
+    last = str(person.get("lastName") or "").strip()
+    full = f"{first} {last}".strip()
+    if full:
+        return full[:120]
+    nickname = str(person.get("nickname") or "").strip()
+    return nickname[:120] if nickname else "Unknown Person"
+
+
+def build_birthday_cadence_insights(data: Dict[str, Any], now: datetime) -> List[Dict[str, Any]]:
+    people = data.get("People") if isinstance(data.get("People"), list) else []
+    phases = [
+        {
+            "days_before": 14,
+            "code": "prep-14",
+            "title": "Birthday Prep Window",
+            "summary": "Two weeks out. Consider gift ideas and plan logistics.",
+            "why": "- Review preferences from prior notes.\n- Decide gift, message, or plan.\n- Schedule final check next week.",
+            "priority": 90,
+        },
+        {
+            "days_before": 7,
+            "code": "prep-7",
+            "title": "Birthday Plan Checkpoint",
+            "summary": "One week out. Finalize gift or message plan.",
+            "why": "- Confirm delivery/reservation timing.\n- Draft a personal message while context is fresh.",
+            "priority": 93,
+        },
+        {
+            "days_before": 1,
+            "code": "day-before",
+            "title": "Birthday Is Tomorrow",
+            "summary": "Final reminder to reach out tomorrow.",
+            "why": "- Queue the message now.\n- Confirm reminder time for tomorrow morning.",
+            "priority": 97,
+        },
+        {
+            "days_before": 0,
+            "code": "today",
+            "title": "Birthday Today",
+            "summary": "Send birthday wishes today.",
+            "why": "- Send the message now.\n- If appropriate, follow up with a call today.",
+            "priority": 99,
+        },
+    ]
+
+    out: List[Dict[str, Any]] = []
+    for person in people:
+        if not isinstance(person, dict):
+            continue
+        person_id = str(person.get("id") or "").strip()
+        birthday_raw = str(person.get("birthday") or "").strip()
+        if not person_id or not birthday_raw:
+            continue
+
+        birthday = parse_birthday_for_current_cycle(birthday_raw, now)
+        if not birthday:
+            continue
+
+        days_until = days_between_dates(birthday, now)
+        person_name = get_person_display_name(person)
+        birthday_date = birthday.date().isoformat()
+
+        for phase in phases:
+            if days_until != phase["days_before"]:
+                continue
+            code = phase["code"]
+            year = birthday.year
+            dedupe_key = f"birthday|{person_id}|{year}|{code}"
+            due_iso = birthday.isoformat()
+            out.append(
+                {
+                    "id": f"birthday-{person_id}-{year}-{code}"[:120],
+                    "dedupeKey": dedupe_key,
+                    "title": f"{person_name}: {phase['title']}"[:180],
+                    "summary": f"{phase['summary']} ({birthday_date})"[:500],
+                    "kind": "time",
+                    "confidence": 0.97,
+                    "freshnessDays": days_until,
+                    "evidence": [
+                        {
+                            "label": f"{person_name} profile"[:120],
+                            "sourceSection": "People",
+                            "sourceId": person_id[:120],
+                            "timestamp": birthday_raw[:40],
+                            "snippet": f"- Birthday: **{birthday_raw}**\n- Reminder window: **{phase['days_before']} day(s) before**",
+                        }
+                    ],
+                    "why": f"### Recommended action\n{phase['why']}"[:1200],
+                    "action": {
+                        "label": "Open Profile",
+                        "sourceSection": "People",
+                        "sourceId": person_id[:120],
+                    },
+                    "secondaryAction": None,
+                    "priority": phase["priority"],
+                    "validTo": due_iso,
+                    "dueDate": due_iso,
+                    "sourceType": "cadence",
+                }
+            )
+
+    return out
 
 
 def memory_item_to_evidence(item: dict, idx: int = 0) -> Optional[dict]:
@@ -665,6 +1151,416 @@ def normalize_memory_item(item: dict, fallback_title: str = "Memory") -> dict:
     }
 
 
+def is_me_profile_memory(item: dict) -> bool:
+    if not isinstance(item, dict):
+        return False
+
+    tags = {tag.lower() for tag in sanitize_tag_list(item.get("tags"))}
+    context = str(item.get("context") or "").strip().lower()
+    document_id = str(item.get("document_id") or "").strip().lower()
+
+    if "section:me" in tags or "profile:self" in tags or "entity:user" in tags:
+        return True
+    if context == "me_profile":
+        return True
+    if document_id == "me-profile":
+        return True
+    return False
+
+
+def merge_memory_results(primary: List[dict], prioritized: List[dict], limit: int = 12) -> List[dict]:
+    out: List[dict] = []
+    seen = set()
+
+    for item in [*(prioritized or []), *(primary or [])]:
+        if not isinstance(item, dict):
+            continue
+        key = (
+            str(item.get("title") or "").strip().lower(),
+            str(item.get("text") or "").strip().lower(),
+            str(item.get("timestamp") or "").strip().lower(),
+        )
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append(item)
+        if len(out) >= limit:
+            break
+
+    return out
+
+
+async def fetch_me_profile_items(budget: str) -> List[dict]:
+    raw_items = await recall_memories_raw(
+        "ME PROFILE USER identity preferences personal context section:me profile:self entity:user",
+        budget,
+        max_tokens=720,
+    )
+    filtered = [item for item in raw_items if is_me_profile_memory(item)]
+    if not filtered:
+        return []
+    return [normalize_memory_item(item, "Profile Fact") for item in filtered[:2]]
+
+
+def should_run_pipeline_scan(fingerprint: str, force: bool = False) -> bool:
+    if force:
+        return True
+
+    with insight_db_lock:
+        conn = get_insight_conn()
+        state = read_scan_state(conn)
+        active_count = conn.execute(
+            "SELECT COUNT(*) AS count FROM insights_canonical WHERE status='active'"
+        ).fetchone()["count"]
+        conn.close()
+
+    last_fingerprint = state.get("last_fingerprint", "")
+    if fingerprint != last_fingerprint:
+        return True
+    if int(active_count or 0) <= 0:
+        return True
+
+    last_scan_at = parse_datetime(state.get("last_scan_at", ""))
+    if not last_scan_at:
+        return True
+
+    elapsed = (datetime.now(timezone.utc) - last_scan_at).total_seconds()
+    last_error = state.get("last_error", "").strip()
+    if last_error:
+        return elapsed >= INSIGHT_ERROR_RETRY_SECONDS
+    return elapsed >= INSIGHT_SCAN_COOLDOWN_SECONDS
+
+
+def insert_insight_event(
+    cursor: sqlite3.Cursor,
+    canonical_id: str,
+    event_type: str,
+    observed_at: str,
+    novelty_score: Optional[float],
+    payload: Dict[str, Any],
+) -> None:
+    cursor.execute(
+        """
+        INSERT INTO insight_events(event_id, canonical_id, event_type, observed_at, novelty_score, payload_json)
+        VALUES(?, ?, ?, ?, ?, ?)
+        """,
+        (
+            f"ev-{uuid.uuid4().hex}",
+            canonical_id,
+            event_type,
+            observed_at,
+            novelty_score,
+            json.dumps(payload, ensure_ascii=False)[:12000],
+        ),
+    )
+
+
+def persist_pipeline_scan_failure(fingerprint: str, error_text: str) -> None:
+    now_iso = utc_now_iso()
+    with insight_db_lock:
+        conn = get_insight_conn()
+        write_scan_state(
+            conn,
+            {
+                "last_fingerprint": fingerprint,
+                "last_scan_at": now_iso,
+                "last_source": "pipeline",
+                "last_error": str(error_text or "")[:500],
+            },
+        )
+        conn.commit()
+        conn.close()
+
+
+def persist_pipeline_insights(
+    incoming_items: List[Dict[str, Any]],
+    source: str,
+    fingerprint: str,
+) -> Dict[str, int]:
+    now = datetime.now(timezone.utc)
+    now_iso = now.isoformat()
+
+    normalized_items: List[Dict[str, Any]] = []
+    for raw in incoming_items:
+        source_type = str(raw.get("sourceType") or "deep")
+        normalized = normalize_pipeline_item(raw, source_type=source_type)
+        if normalized:
+            normalized_items.append(normalized)
+
+    with insight_db_lock:
+        conn = get_insight_conn()
+        cursor = conn.cursor()
+        rows = cursor.execute("SELECT * FROM insights_canonical").fetchall()
+        existing: List[Dict[str, Any]] = [dict(row) for row in rows]
+
+        observed_ids = set()
+        created = 0
+        reinforced = 0
+        expired = 0
+
+        for item in normalized_items:
+            dedupe_key = str(item.get("dedupeKey") or build_insight_dedupe_key(item))[:500]
+            signature = str(item.get("signature") or build_insight_signature(item))
+
+            match = next((row for row in existing if str(row.get("dedupe_key") or "") == dedupe_key), None)
+            best_score = 1.0 if match else 0.0
+
+            if match is None:
+                for row in existing:
+                    candidate_signature = str(row.get("signature") or "")
+                    if not candidate_signature:
+                        continue
+                    score = similarity_score(signature, candidate_signature)
+                    if str(row.get("kind") or "") == str(item.get("kind") or ""):
+                        score = min(1.0, score + 0.02)
+                    if score > best_score:
+                        best_score = score
+                        match = row
+
+            if match and best_score >= INSIGHT_NOVELTY_THRESHOLD:
+                canonical_id = str(match.get("canonical_id"))
+                observed_ids.add(canonical_id)
+
+                prior_conf = float(match.get("confidence") or 0.66)
+                incoming_conf = float(item.get("confidence") or 0.66)
+                next_conf = clamp(max(prior_conf, incoming_conf), 0.25, 0.99)
+
+                prior_reinforcement = int(match.get("reinforcement_count") or 0)
+                reinforcement_count = prior_reinforcement + 1
+
+                current_summary = str(match.get("summary") or "")
+                current_why = str(match.get("why_text") or "")
+                next_summary = item["summary"] if len(item["summary"]) >= len(current_summary) else current_summary
+                next_why = item.get("why") if len(item.get("why") or "") >= len(current_why) else current_why
+
+                action_json = (
+                    json.dumps(item.get("action"), ensure_ascii=False)
+                    if item.get("action")
+                    else str(match.get("action_json") or "null")
+                )
+                evidence_json = json.dumps(item.get("evidence") or [], ensure_ascii=False)
+                due_date = item.get("dueDate") or str(match.get("due_date") or "") or None
+                valid_to = item.get("validTo") or str(match.get("valid_to") or "") or None
+
+                cursor.execute(
+                    """
+                    UPDATE insights_canonical
+                    SET signature=?, title=?, summary=?, kind=?, confidence=?, freshness_days=?, priority=?,
+                        valid_to=?, due_date=?, why_text=?, action_json=?, evidence_json=?, source_type=?,
+                        status='active', last_seen_at=?, updated_at=?, reinforcement_count=?
+                    WHERE canonical_id=?
+                    """,
+                    (
+                        signature,
+                        item["title"],
+                        next_summary,
+                        item["kind"],
+                        next_conf,
+                        item.get("freshnessDays"),
+                        item.get("priority"),
+                        valid_to,
+                        due_date,
+                        next_why,
+                        action_json,
+                        evidence_json,
+                        item.get("sourceType") or "deep",
+                        now_iso,
+                        now_iso,
+                        reinforcement_count,
+                        canonical_id,
+                    ),
+                )
+
+                insert_insight_event(
+                    cursor,
+                    canonical_id=canonical_id,
+                    event_type="reinforced",
+                    observed_at=now_iso,
+                    novelty_score=round(best_score, 4),
+                    payload={
+                        "title": item["title"],
+                        "summary": item["summary"],
+                        "kind": item["kind"],
+                    },
+                )
+                reinforced += 1
+
+                match["title"] = item["title"]
+                match["summary"] = next_summary
+                match["kind"] = item["kind"]
+                match["confidence"] = next_conf
+                match["freshness_days"] = item.get("freshnessDays")
+                match["priority"] = item.get("priority")
+                match["valid_to"] = valid_to
+                match["due_date"] = due_date
+                match["why_text"] = next_why
+                match["action_json"] = action_json
+                match["evidence_json"] = evidence_json
+                match["source_type"] = item.get("sourceType") or "deep"
+                match["status"] = "active"
+                match["last_seen_at"] = now_iso
+                match["updated_at"] = now_iso
+                match["reinforcement_count"] = reinforcement_count
+                match["signature"] = signature
+                continue
+
+            canonical_id = str(item.get("id") or f"insight-{uuid.uuid4().hex[:10]}")
+            while any(str(row.get("canonical_id") or "") == canonical_id for row in existing):
+                canonical_id = f"insight-{uuid.uuid4().hex[:10]}"
+
+            cursor.execute(
+                """
+                INSERT INTO insights_canonical(
+                    canonical_id, dedupe_key, signature, title, summary, kind, confidence,
+                    freshness_days, priority, valid_to, due_date, why_text, action_json, evidence_json,
+                    source_type, status, first_seen_at, last_seen_at, updated_at, reinforcement_count
+                )
+                VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'active', ?, ?, ?, 0)
+                """,
+                (
+                    canonical_id,
+                    dedupe_key,
+                    signature,
+                    item["title"],
+                    item["summary"],
+                    item["kind"],
+                    item["confidence"],
+                    item.get("freshnessDays"),
+                    item.get("priority"),
+                    item.get("validTo"),
+                    item.get("dueDate"),
+                    item.get("why"),
+                    json.dumps(item.get("action"), ensure_ascii=False),
+                    json.dumps(item.get("evidence") or [], ensure_ascii=False),
+                    item.get("sourceType") or "deep",
+                    now_iso,
+                    now_iso,
+                    now_iso,
+                ),
+            )
+            insert_insight_event(
+                cursor,
+                canonical_id=canonical_id,
+                event_type="new",
+                observed_at=now_iso,
+                novelty_score=0.0,
+                payload={
+                    "title": item["title"],
+                    "summary": item["summary"],
+                    "kind": item["kind"],
+                },
+            )
+            existing.append(
+                {
+                    "canonical_id": canonical_id,
+                    "dedupe_key": dedupe_key,
+                    "signature": signature,
+                    "title": item["title"],
+                    "summary": item["summary"],
+                    "kind": item["kind"],
+                    "confidence": item["confidence"],
+                    "freshness_days": item.get("freshnessDays"),
+                    "priority": item.get("priority"),
+                    "valid_to": item.get("validTo"),
+                    "due_date": item.get("dueDate"),
+                    "why_text": item.get("why"),
+                    "action_json": json.dumps(item.get("action"), ensure_ascii=False),
+                    "evidence_json": json.dumps(item.get("evidence") or [], ensure_ascii=False),
+                    "source_type": item.get("sourceType") or "deep",
+                    "status": "active",
+                    "first_seen_at": now_iso,
+                    "last_seen_at": now_iso,
+                    "updated_at": now_iso,
+                    "reinforcement_count": 0,
+                }
+            )
+            observed_ids.add(canonical_id)
+            created += 1
+
+        for row in existing:
+            canonical_id = str(row.get("canonical_id") or "")
+            if not canonical_id:
+                continue
+            if str(row.get("status") or "active") != "active":
+                continue
+            is_observed = canonical_id in observed_ids
+
+            source_type = str(row.get("source_type") or "deep")
+            last_seen = parse_datetime(str(row.get("last_seen_at") or "")) or now
+            due_date = parse_datetime(str(row.get("due_date") or row.get("valid_to") or ""))
+            freshness_days = coerce_int(row.get("freshness_days"), None)
+            elapsed = (now - last_seen).total_seconds()
+            should_expire = False
+
+            if due_date and now > (due_date + timedelta(days=INSIGHT_STALE_DUE_GRACE_DAYS)):
+                should_expire = True
+            elif source_type == "cadence":
+                if (not is_observed) and elapsed >= 3 * 24 * 3600:
+                    should_expire = True
+            else:
+                if freshness_days is not None and freshness_days > INSIGHT_MAX_ACTIVE_FRESHNESS_DAYS:
+                    should_expire = True
+                elif (not is_observed) and elapsed >= 35 * 24 * 3600:
+                    should_expire = True
+
+            if should_expire:
+                cursor.execute(
+                    """
+                    UPDATE insights_canonical
+                    SET status='expired', updated_at=?
+                    WHERE canonical_id=?
+                    """,
+                    (now_iso, canonical_id),
+                )
+                insert_insight_event(
+                    cursor,
+                    canonical_id=canonical_id,
+                    event_type="expired",
+                    observed_at=now_iso,
+                    novelty_score=None,
+                    payload={"reason": "stale"},
+                )
+                expired += 1
+
+        write_scan_state(
+            conn,
+            {
+                "last_fingerprint": fingerprint,
+                "last_scan_at": now_iso,
+                "last_source": source,
+                "last_error": "",
+            },
+        )
+
+        conn.commit()
+        conn.close()
+
+    return {"created": created, "reinforced": reinforced, "expired": expired}
+
+
+def load_pipeline_snapshot(limit: int = INSIGHT_MAX_ENTRIES) -> Dict[str, Any]:
+    with insight_db_lock:
+        conn = get_insight_conn()
+        state = read_scan_state(conn)
+        rows = conn.execute(
+            """
+            SELECT * FROM insights_canonical
+            ORDER BY datetime(last_seen_at) DESC, priority DESC
+            LIMIT ?
+            """,
+            (int(limit),),
+        ).fetchall()
+        conn.close()
+
+    entries = [serialize_db_entry(row) for row in rows]
+    return {
+        "entries": entries,
+        "lastScanAt": state.get("last_scan_at", ""),
+        "source": state.get("last_source", ""),
+        "error": state.get("last_error", ""),
+    }
+
+
 def infer_insight_kind(text: str) -> str:
     lower = str(text or "").lower()
     if re.search(r"\brisk\b|\bconflict\b|\bblocked\b|\bmiss(?:ed|ing)?\b|\bstale\b", lower):
@@ -738,20 +1634,28 @@ def build_action_candidates(data: Dict[str, Any]) -> List[dict]:
     return candidates
 
 
-def pick_action_for_text(text: str, candidates: List[dict]) -> Optional[dict]:
+def pick_action_for_text(text: str, candidates: List[dict], section_hint: str = "") -> Optional[dict]:
     lower = str(text or "").lower()
     if not lower:
         return None
-    for candidate in candidates:
-        needle = candidate.get("needle")
-        if not needle:
-            continue
-        if needle in lower:
-            return {
-                "label": candidate.get("label", "Open Source"),
-                "sourceSection": candidate.get("section", ""),
-                "sourceId": candidate.get("source_id", ""),
-            }
+
+    hint = normalize_section_name(section_hint)
+    pass_sets = []
+    if hint:
+        pass_sets.append([candidate for candidate in candidates if normalize_section_name(candidate.get("section")) == hint])
+    pass_sets.append(candidates)
+
+    for pool in pass_sets:
+        for candidate in pool:
+            needle = candidate.get("needle")
+            if not needle:
+                continue
+            if needle in lower:
+                return {
+                    "label": candidate.get("label", "Open Source"),
+                    "sourceSection": candidate.get("section", ""),
+                    "sourceId": candidate.get("source_id", ""),
+                }
     return None
 
 
@@ -899,6 +1803,8 @@ async def fetch_hindsight_context(
         if reflect_text and not items:
             items = [{"title": "Reflect Summary", "text": reflect_text[:500], "timestamp": "", "context": "reflect", "tags": []}]
 
+        me_items = await fetch_me_profile_items(budget)
+        items = merge_memory_results(items, me_items, limit=10)
         return build_memory_context(items, reflect_text), items, reflect_text
 
     payload = {"query": query, "budget": budget, "max_tokens": 2200}
@@ -933,6 +1839,8 @@ async def fetch_hindsight_context(
     content_type = response.headers.get("content-type") or ""
     data = response.json() if "application/json" in content_type else []
     items = [normalize_memory_item(item) for item in as_list_payload(data)]
+    me_items = await fetch_me_profile_items(budget)
+    items = merge_memory_results(items, me_items, limit=10)
 
     return build_memory_context(items), items, ""
 
@@ -973,6 +1881,73 @@ async def store_chat_memory(session_id: str, user_text: str, assistant_text: str
         await http_client.post(f"{HINDSIGHT_URL}/v1/default/banks/{BANK_ID}/memories", json=payload)
     except Exception as e:
         print(f"Store memory warning: {e}")
+
+
+@app.post("/insights/pipeline")
+async def insights_pipeline_endpoint(req: InsightPipelineRequest):
+    safe_budget = normalize_budget(req.reasoning_budget)
+    max_items = max(2, min(req.max_items, 10))
+    raw_data = req.data if isinstance(req.data, dict) else {}
+    fingerprint = build_pipeline_fingerprint(raw_data)
+
+    ran_scan = False
+    source = ""
+    error_text = ""
+    scan_stats = {"created": 0, "reinforced": 0, "expired": 0}
+
+    if should_run_pipeline_scan(fingerprint, force=req.force):
+        ran_scan = True
+        now = datetime.now(timezone.utc)
+        pipeline_items: List[Dict[str, Any]] = build_birthday_cadence_insights(raw_data, now)
+
+        if req.use_reflect and http_client:
+            try:
+                raw_items, reflect_text = await fetch_structured_reflect_insights(safe_budget, max_items)
+                source = "hindsight-reflect-structured"
+
+                if not raw_items and reflect_text:
+                    raw_items = parse_reflect_text_to_insights(reflect_text, raw_data, max_items)
+                    source = "hindsight-reflect-derived"
+
+                normalized = normalize_deep_insights(raw_items, raw_data, max_items)
+                if normalized:
+                    needs_recall_enrichment = any(
+                        not (isinstance(item.get("evidence"), list) and item.get("evidence"))
+                        for item in normalized
+                        if isinstance(item, dict)
+                    )
+                    enriched = (
+                        await enrich_deep_insights_with_recall(normalized, safe_budget)
+                        if needs_recall_enrichment
+                        else normalized
+                    )
+                    pipeline_items.extend(enriched)
+                elif not pipeline_items:
+                    error_text = "Reflect returned no parseable insights"
+            except Exception as exc:
+                error_text = str(exc)
+                print(f"Pipeline reflect warning: {exc}")
+        elif not pipeline_items:
+            error_text = "Reflect mode or memory client unavailable"
+
+        if pipeline_items:
+            if not source:
+                source = "cadence-only"
+            scan_stats = persist_pipeline_insights(pipeline_items, source, fingerprint)
+            error_text = ""
+        else:
+            persist_pipeline_scan_failure(fingerprint, error_text or "No insights generated")
+
+    snapshot = load_pipeline_snapshot()
+    response = {
+        "entries": snapshot.get("entries", []),
+        "lastScanAt": snapshot.get("lastScanAt", ""),
+        "source": snapshot.get("source", source or ""),
+        "error": snapshot.get("error", "") or error_text,
+        "ranScan": ran_scan,
+        "scanStats": scan_stats,
+    }
+    return response
 
 
 @app.post("/insights/deep")

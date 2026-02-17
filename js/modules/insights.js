@@ -400,49 +400,44 @@ function applyCadenceSignalsToLog(state, data) {
     return mergeLogEntries(state, cadenceSignals, 'cadence');
 }
 
-function shouldRunDeepScan(state, fingerprint, now = new Date()) {
-    if (state.fingerprint !== fingerprint) return true;
+async function fetchPipelineInsights(data, options = {}) {
+    if (scanPromise) return scanPromise;
 
-    const lastScan = parseDate(state.lastScanAt);
-    if (!lastScan) return true;
+    runtimeState.loading = true;
+    runtimeState.error = '';
 
-    const elapsed = now.getTime() - lastScan.getTime();
-    const hasDeepEntries = Array.isArray(state.entries) && state.entries.some((entry) => entry?.sourceType === 'deep');
+    const includeDeep = options.includeDeep !== false;
+    const forceScan = !!options.forceScan;
 
-    if (runtimeState.error) return elapsed >= ERROR_RETRY_MS;
-    if (!hasDeepEntries) return true;
-    return elapsed >= SCAN_COOLDOWN_MS;
-}
-
-async function fetchDeepInsights(data) {
-    const response = await fetch('/insights/deep', {
+    scanPromise = fetch('/insights/pipeline', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
             data,
             max_items: DEEP_FETCH_LIMIT,
             reasoning_budget: appSettings.reasoningBudget || 'mid',
-            use_reflect: true
+            use_reflect: includeDeep,
+            force: forceScan
         })
-    });
+    })
+        .then(async (response) => {
+            if (!response.ok) {
+                throw new Error(`Insight pipeline failed (${response.status})`);
+            }
+            const payload = await response.json();
+            return {
+                entries: Array.isArray(payload?.entries) ? payload.entries : [],
+                source: String(payload?.source || '').slice(0, 120),
+                error: String(payload?.error || ''),
+                lastScanAt: String(payload?.lastScanAt || '')
+            };
+        })
+        .finally(() => {
+            runtimeState.loading = false;
+            scanPromise = null;
+        });
 
-    if (!response.ok) {
-        throw new Error(`Deep insights failed (${response.status})`);
-    }
-
-    const payload = await response.json();
-    const rawItems = Array.isArray(payload?.insights) ? payload.insights : [];
-
-    const items = rawItems
-        .map((item, index) => normalizeDeepInsightItem(item, index))
-        .filter(Boolean)
-        .slice(0, DEEP_FETCH_LIMIT);
-
-    return {
-        items,
-        source: String(payload?.source || '').slice(0, 80),
-        error: String(payload?.error || '')
-    };
+    return scanPromise;
 }
 
 function computeDueDays(entry, now) {
@@ -453,13 +448,14 @@ function computeDueDays(entry, now) {
 
 function buildInsightsModel(state, options = {}) {
     const now = new Date();
-    const entries = Array.isArray(state.entries)
+    const allEntries = Array.isArray(state.entries)
         ? [...state.entries].sort((a, b) => {
             const pDelta = (b.priority || 0) - (a.priority || 0);
             if (pDelta !== 0) return pDelta;
             return (parseDate(b.lastSeenAt)?.getTime() || 0) - (parseDate(a.lastSeenAt)?.getTime() || 0);
         })
         : [];
+    const activeEntries = allEntries.filter((entry) => !['expired', 'resolved'].includes(String(entry.status || 'active').toLowerCase()));
 
     const sections = {
         next: [],
@@ -469,7 +465,7 @@ function buildInsightsModel(state, options = {}) {
         log: []
     };
 
-    entries.forEach((entry) => {
+    activeEntries.forEach((entry) => {
         const dueDays = computeDueDays(entry, now);
         const textBlob = `${entry.title || ''} ${entry.summary || ''}`.toLowerCase();
         const isRisk = String(entry.kind || '').toLowerCase().includes('risk') || /\brisk\b|\bconflict\b|\bmiss\b|\bstale\b/.test(textBlob);
@@ -485,7 +481,7 @@ function buildInsightsModel(state, options = {}) {
         }
     });
 
-    sections.log = [...entries]
+    sections.log = [...allEntries]
         .sort((a, b) => (parseDate(b.firstSeenAt)?.getTime() || 0) - (parseDate(a.firstSeenAt)?.getTime() || 0));
 
     const limits = {
@@ -500,21 +496,21 @@ function buildInsightsModel(state, options = {}) {
         sections[key] = sections[key].slice(0, limits[key]);
     });
 
-    const dueSoonCount = entries.filter((entry) => {
+    const dueSoonCount = activeEntries.filter((entry) => {
         const dueDays = computeDueDays(entry, now);
         return dueDays != null && dueDays >= 0 && dueDays <= 14;
     }).length;
 
-    const recentCount = entries.filter((entry) => {
+    const recentCount = activeEntries.filter((entry) => {
         const firstSeen = parseDate(entry.firstSeenAt);
         return firstSeen && daysBetween(toDateOnly(now), toDateOnly(firstSeen)) <= 7;
     }).length;
 
     const summary = {
-        active: entries.length,
+        active: activeEntries.length,
         dueSoon: dueSoonCount,
         risks: sections.risks.length,
-        logged: state.entries?.length || 0,
+        logged: allEntries.length,
         recent: recentCount
     };
 
@@ -546,6 +542,11 @@ function renderChips(insight) {
 
 function renderInsightCard(insight, options = {}) {
     const includeExplain = options.includeExplain !== false;
+    const formatActionLabel = (value = 'Open') => {
+        const raw = String(value || 'Open').replace(/\s+/g, ' ').trim();
+        if (!raw) return 'Open';
+        return raw.length > 42 ? `${raw.slice(0, 41)}…` : raw;
+    };
 
     return `
         <article class="insight-card" data-insight-id="${escapeHtml(insight.id)}">
@@ -555,8 +556,8 @@ function renderInsightCard(insight, options = {}) {
             </div>
             <div class="insight-card-summary">${escapeHtml(insight.summary)}</div>
             <div class="insight-actions">
-                ${insight.action ? `<button class="insight-btn" data-action="open-item" data-source-section="${escapeHtml(insight.action.sourceSection)}" data-source-id="${escapeHtml(insight.action.sourceId)}">${escapeHtml(insight.action.label || 'Open')}</button>` : ''}
-                ${insight.secondaryAction ? `<button class="insight-btn" data-action="open-item" data-source-section="${escapeHtml(insight.secondaryAction.sourceSection)}" data-source-id="${escapeHtml(insight.secondaryAction.sourceId)}">${escapeHtml(insight.secondaryAction.label || 'Open Related')}</button>` : ''}
+                ${insight.action ? `<button class="insight-btn" data-action="open-item" data-insight-id="${escapeHtml(insight.id)}" data-source-section="${escapeHtml(insight.action.sourceSection)}" data-source-id="${escapeHtml(insight.action.sourceId)}" data-source-hint="${escapeHtml(truncateText(`${insight.title} ${insight.summary}`, 180))}" title="${escapeHtml(insight.action.label || 'Open')}">${escapeHtml(formatActionLabel(insight.action.label || 'Open'))}</button>` : ''}
+                ${insight.secondaryAction ? `<button class="insight-btn" data-action="open-item" data-insight-id="${escapeHtml(insight.id)}" data-source-section="${escapeHtml(insight.secondaryAction.sourceSection)}" data-source-id="${escapeHtml(insight.secondaryAction.sourceId)}" data-source-hint="${escapeHtml(truncateText(`${insight.title} ${insight.summary}`, 180))}" title="${escapeHtml(insight.secondaryAction.label || 'Open Related')}">${escapeHtml(formatActionLabel(insight.secondaryAction.label || 'Open Related'))}</button>` : ''}
                 ${includeExplain ? `<button class="insight-btn" data-action="open-explain" data-insight-id="${escapeHtml(insight.id)}">Explain</button>` : ''}
             </div>
         </article>
@@ -624,12 +625,13 @@ function renderExplainPanel() {
 
     const evidenceHtml = (insight.evidence || []).map((entry) => {
         const snippetHtml = parseMarkdown(entry.snippet || 'No snippet');
+        const hint = truncateText(`${entry.label || ''} ${entry.snippet || ''}`, 180);
         return `
             <div class="insight-evidence-entry">
                 <div class="insight-evidence-head">${escapeHtml(entry.label || 'Evidence')}</div>
                 <div class="insight-evidence-meta">${escapeHtml(formatDate(entry.timestamp))}</div>
                 <div class="insight-evidence-snippet markdown-content">${snippetHtml}</div>
-                ${entry.sourceId ? `<button class="insight-btn" data-action="open-item" data-source-section="${escapeHtml(entry.sourceSection || 'People')}" data-source-id="${escapeHtml(entry.sourceId)}">Open Source</button>` : ''}
+                ${entry.sourceId ? `<button class="insight-btn" data-action="open-item" data-insight-id="${escapeHtml(insight.id)}" data-source-section="${escapeHtml(entry.sourceSection || 'People')}" data-source-id="${escapeHtml(entry.sourceId)}" data-source-hint="${escapeHtml(hint)}">Open Source</button>` : ''}
             </div>
         `;
     }).join('');
@@ -650,18 +652,151 @@ function renderExplainPanel() {
     `;
 }
 
-function openSourceItem(sourceSection, sourceId) {
-    if (!sourceSection || !sourceId) return;
+function normalizeSection(value = '') {
+    const key = String(value || '').trim().toLowerCase();
+    if (key === 'person' || key === 'people') return 'People';
+    if (key === 'group' || key === 'groups') return 'Groups';
+    if (key === 'note' || key === 'notes') return 'Notes';
+    return '';
+}
+
+function buildSearchableText(section, item) {
+    if (!item || typeof item !== 'object') return '';
+    if (section === 'People') {
+        return [
+            item.firstName,
+            item.lastName,
+            item.nickname,
+            item.notes,
+            ...(Array.isArray(item.extraFields) ? item.extraFields.map((pair) => `${pair?.key || ''} ${pair?.value || ''}`) : [])
+        ].join(' ').toLowerCase();
+    }
+    if (section === 'Groups') {
+        return [item.name, item.description].join(' ').toLowerCase();
+    }
+    return [item.title, item.body].join(' ').toLowerCase();
+}
+
+function buildHintTokens(raw = '') {
+    const seen = new Set();
+    return String(raw || '')
+        .toLowerCase()
+        .replace(/[^a-z0-9\s]/g, ' ')
+        .split(/\s+/)
+        .map((token) => token.trim())
+        .filter((token) => token.length >= 3)
+        .filter((token) => {
+            if (seen.has(token)) return false;
+            seen.add(token);
+            return true;
+        })
+        .slice(0, 14);
+}
+
+function findBestItemId(data, section, hintText) {
+    const items = Array.isArray(data?.[section]) ? data[section] : [];
+    if (!items.length) return '';
+
+    const tokens = buildHintTokens(hintText);
+    if (!tokens.length) return '';
+
+    let bestId = '';
+    let bestScore = 0;
+
+    items.forEach((item) => {
+        const haystack = buildSearchableText(section, item);
+        if (!haystack) return;
+
+        let score = 0;
+        tokens.forEach((token) => {
+            if (haystack.includes(token)) score += token.length;
+        });
+
+        if (score > bestScore) {
+            bestScore = score;
+            bestId = String(item.id || '');
+        }
+    });
+
+    return bestScore > 0 ? bestId : '';
+}
+
+function locateSectionForId(data, sourceId = '') {
+    const rawId = String(sourceId || '').trim();
+    if (!rawId) return '';
+
+    const sections = ['People', 'Groups', 'Notes'];
+    for (const section of sections) {
+        const items = Array.isArray(data?.[section]) ? data[section] : [];
+        if (items.some((item) => String(item?.id || '') === rawId)) {
+            return section;
+        }
+    }
+    return '';
+}
+
+function openSourceItem(sourceSection, sourceId, insightId = '', sourceHint = '') {
+    const data = getStoredData();
+    if (!data || typeof data !== 'object') return;
+
+    let targetSection = normalizeSection(sourceSection) || 'People';
+    let resolvedId = '';
+    const sourceIdText = String(sourceId || '').trim();
+
+    if (sourceIdText) {
+        const items = Array.isArray(data[targetSection]) ? data[targetSection] : [];
+        if (items.some((item) => String(item?.id || '') === sourceIdText)) {
+            resolvedId = sourceIdText;
+        } else {
+            const crossSection = locateSectionForId(data, sourceIdText);
+            if (crossSection) {
+                targetSection = crossSection;
+                resolvedId = sourceIdText;
+            }
+        }
+    }
+
+    const insight = insightId ? insightIndex.get(insightId) : null;
+    const hintText = [
+        sourceHint,
+        insight?.title || '',
+        insight?.summary || '',
+        ...(Array.isArray(insight?.evidence) ? insight.evidence.map((entry) => `${entry?.label || ''} ${entry?.snippet || ''}`) : [])
+    ].join(' ');
+
+    if (!resolvedId) {
+        resolvedId = findBestItemId(data, targetSection, hintText);
+    }
+
+    if (!resolvedId) {
+        ['People', 'Groups', 'Notes'].some((section) => {
+            const candidateId = findBestItemId(data, section, hintText);
+            if (!candidateId) return false;
+            targetSection = section;
+            resolvedId = candidateId;
+            return true;
+        });
+    }
 
     const notesIcon = document.querySelector('.sidebar-icon[data-page="notes-page"]');
     if (window.loadPage) window.loadPage('notes-page', notesIcon);
 
     if (window.switchSection) {
-        const tab = Array.from(document.querySelectorAll('.tab-btn')).find((btn) => btn.innerText.trim() === sourceSection);
-        window.switchSection(sourceSection, tab);
+        const tab = Array.from(document.querySelectorAll('.tab-btn')).find((btn) => btn.innerText.trim() === targetSection);
+        window.switchSection(targetSection, tab);
     }
 
-    if (window.loadItemIntoEditor) window.loadItemIntoEditor(sourceId);
+    if (resolvedId && window.loadItemIntoEditor) {
+        const loaded = window.loadItemIntoEditor(resolvedId);
+        if (loaded !== false) return;
+    }
+
+    const searchSeed = buildHintTokens(hintText).slice(0, 4).join(' ');
+    const searchInput = document.getElementById('search-input');
+    if (searchInput && searchSeed) {
+        searchInput.value = searchSeed;
+        searchInput.dispatchEvent(new Event('input', { bubbles: true }));
+    }
 }
 
 function bindInsightInteractions(container, options = {}) {
@@ -674,7 +809,12 @@ function bindInsightInteractions(container, options = {}) {
         const action = trigger.dataset.action;
 
         if (action === 'open-item') {
-            openSourceItem(trigger.dataset.sourceSection, trigger.dataset.sourceId);
+            openSourceItem(
+                trigger.dataset.sourceSection,
+                trigger.dataset.sourceId,
+                trigger.dataset.insightId,
+                trigger.dataset.sourceHint
+            );
             return;
         }
 
@@ -729,63 +869,52 @@ function renderInsightsMarkup(model, logState, options = {}) {
     `;
 }
 
-async function runDeepScan(data, fingerprint) {
-    if (scanPromise) return scanPromise;
-
-    runtimeState.loading = true;
-    runtimeState.error = '';
-
-    scanPromise = fetchDeepInsights(data)
-        .then(({ items, source, error }) => {
-            const state = loadInsightLogState();
-            mergeLogEntries(state, items, 'deep');
-            applyCadenceSignalsToLog(state, data);
-            state.entries = pruneLogEntries(state.entries);
-            state.fingerprint = fingerprint;
-            state.lastScanAt = new Date().toISOString();
-            saveInsightLogState(state);
-
-            runtimeState.source = source || runtimeState.source;
-            runtimeState.lastScanAt = state.lastScanAt;
-            runtimeState.error = items.length ? '' : (error || '');
-        })
-        .catch((error) => {
-            const state = loadInsightLogState();
-            applyCadenceSignalsToLog(state, data);
-            state.fingerprint = fingerprint;
-            state.lastScanAt = new Date().toISOString();
-            saveInsightLogState(state);
-
-            runtimeState.lastScanAt = state.lastScanAt;
-            runtimeState.error = error?.message || 'Deep scan failed';
-        })
-        .finally(() => {
-            runtimeState.loading = false;
-            scanPromise = null;
-        });
-
-    return scanPromise;
-}
-
 async function renderInsightsContainer(container, options = {}) {
     if (!container) return;
 
     const data = getStoredData();
-    const fingerprint = buildDataFingerprint(data);
+    runtimeState.loading = true;
+    runtimeState.error = '';
 
-    const logState = loadInsightLogState();
-    applyCadenceSignalsToLog(logState, data);
-    logState.entries = pruneLogEntries(logState.entries);
-    saveInsightLogState(logState);
+    const loadingState = {
+        entries: [],
+        lastScanAt: runtimeState.lastScanAt || ''
+    };
+    const loadingModel = buildInsightsModel(loadingState, options);
+    insightIndex = new Map();
+    container.innerHTML = renderInsightsMarkup(loadingModel, loadingState, options);
+    bindInsightInteractions(container, { allowExplain: options.includeExplain !== false });
 
-    const shouldScan = options.includeDeep !== false && shouldRunDeepScan(logState, fingerprint, new Date());
-    if (shouldScan && !runtimeState.loading) {
-        runDeepScan(data, fingerprint).then(() => {
-            if (container.isConnected) renderInsightsContainer(container, options);
+    let pipelineState = {
+        entries: [],
+        source: '',
+        error: '',
+        lastScanAt: ''
+    };
+
+    try {
+        pipelineState = await fetchPipelineInsights(data, {
+            includeDeep: options.includeDeep !== false,
+            forceScan: !!options.forceScan
         });
+    } catch (error) {
+        runtimeState.error = error?.message || 'Insight pipeline failed';
+        pipelineState = {
+            entries: [],
+            source: '',
+            error: runtimeState.error,
+            lastScanAt: runtimeState.lastScanAt || ''
+        };
     }
 
-    const latestState = loadInsightLogState();
+    runtimeState.source = pipelineState.source || runtimeState.source;
+    runtimeState.lastScanAt = pipelineState.lastScanAt || runtimeState.lastScanAt;
+    runtimeState.error = pipelineState.error || '';
+
+    const latestState = {
+        entries: Array.isArray(pipelineState.entries) ? pipelineState.entries : [],
+        lastScanAt: pipelineState.lastScanAt || ''
+    };
     const model = buildInsightsModel(latestState, options);
 
     insightIndex = new Map();

@@ -43,7 +43,9 @@ function setAgentTask(task = 'idle', detail = '') {
 
     const label = TASK_LABELS[task] || task.replace(/_/g, ' ');
     taskLabelEl.textContent = label;
-    taskDetailEl.textContent = detail || '';
+    const nextDetail = (detail || '').trim();
+    taskDetailEl.textContent = nextDetail;
+    taskDetailEl.style.display = nextDetail ? 'block' : 'none';
 }
 
 function renderHindsightOutput(items = []) {
@@ -149,13 +151,13 @@ export function initLLMPage() {
                     </div>
                 </div>
             </div>
+            <div class="agent-console-subhead">Recovered Context</div>
+            <div id="hindsight-output-panel" class="hindsight-output-panel empty"></div>
             <div class="agent-console-task">
                 <span class="agent-task-label">Current Task</span>
                 <span id="agent-task-text">Idle</span>
-                <span id="agent-task-detail"></span>
+                <span id="agent-task-detail" style="display:none"></span>
             </div>
-            <div class="agent-console-subhead">Recovered Context</div>
-            <div id="hindsight-output-panel" class="hindsight-output-panel empty"></div>
         </div>
 
         <div id="chat-history">
@@ -182,7 +184,7 @@ export function initLLMPage() {
 
     chatInitialized = true;
     applyAgentConfigUI();
-    setAgentTask('idle', 'Waiting for query');
+    setAgentTask('idle', '');
     renderHindsightOutput([]);
 }
 
