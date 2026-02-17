@@ -34,7 +34,7 @@ This document summarizes what each project-maintained file does.
 
 ### `/Users/yash/Desktop/org/css/styles.css`
 - Defines the complete visual system for the app (dark detective-style theme, spacing, typography, controls).
-- Styles the core CRM editor/list UI, Quill editor areas, settings cards, insights widgets, graph/timeline/table views, and chat interface.
+- Styles the core CRM editor/list UI, Quill editor areas, key/value field inputs, settings cards, insights widgets, graph/timeline views, and chat interface.
 - Includes behavior-linked classes used by JS (for example blur mode, active state classes, graph highlight/dim classes).
 
 ## Frontend app code
@@ -42,9 +42,9 @@ This document summarizes what each project-maintained file does.
 ### `/Users/yash/Desktop/org/js/app.js`
 - Main frontend controller and state manager.
 - Handles:
-  - section/page navigation
+  - section/page navigation (URL state + back/forward support)
   - list rendering/filter/sort
-  - editor field generation by section (`People`, `Groups`, `Items`, `General`, `Me`)
+  - editor field generation by section (`People`, `Groups`, `Notes`, `Me`)
   - create/save/delete CRUD flows in localStorage
   - settings toggles and appearance updates
   - profile ("Me") save/load
@@ -53,6 +53,7 @@ This document summarizes what each project-maintained file does.
 ### `/Users/yash/Desktop/org/js/core/store.js`
 - Central local storage + settings module.
 - Defines default app settings, loads/saves settings, applies appearance variables/classes, and reads/writes CRM data payloads.
+- Migrates legacy `Items`/`General` notes and older hardcoded contact fields into normalized `Notes` and key/value `extraFields`.
 
 ### `/Users/yash/Desktop/org/js/core/utils.js`
 - Utility helpers for date field handling.
@@ -76,7 +77,7 @@ This document summarizes what each project-maintained file does.
 - Renders clickable insight cards that open related records.
 
 ### `/Users/yash/Desktop/org/js/modules/graph.js`
-- Controls Graph page initialization and mode switching (`Network`, `Table`, `Timeline`).
+- Controls Graph page initialization and mode switching (`Network`, `Timeline`).
 - Pulls graph data from Hindsight via `hindsight.getGraph()`.
 - Processes nodes/edges for rendering, handles entity filtering/highlighting, and manages detail panel interactions.
 - Uses D3 force simulation for interactive network rendering and drag behavior.

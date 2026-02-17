@@ -30,7 +30,6 @@ export function initGraphPage() {
             <div id="graph-controls-bar">
                 <div class="graph-btn-group">
                     <div class="view-btn active" id="btn-view-graph">Network</div>
-                    <div class="view-btn" id="btn-view-table">Table</div>
                     <div class="view-btn" id="btn-view-timeline">Timeline</div>
                 </div>
                 
@@ -62,7 +61,6 @@ export function initGraphPage() {
                 <div class="legend-item"><div class="legend-line" style="background:${COLORS.activeEdge}"></div>Selected</div>
             </div>
 
-            <div id="graph-table-view"></div>
             <div id="graph-timeline-view"></div>
             
             <div id="graph-details-panel">
@@ -74,7 +72,6 @@ export function initGraphPage() {
         
         // Bind events
         document.getElementById('btn-view-graph').onclick = () => switchGraphView('graph');
-        document.getElementById('btn-view-table').onclick = () => switchGraphView('table');
         document.getElementById('btn-view-timeline').onclick = () => switchGraphView('timeline');
         document.getElementById('btn-reset-zoom').onclick = resetGraphZoom;
         document.getElementById('btn-refresh-graph').onclick = refreshGraphData;
@@ -102,9 +99,9 @@ function resetGraphZoom() {
 }
 
 export async function refreshGraphData() {
-    const container = (currentViewMode === 'graph') ? document.getElementById('graph-container') : 
-                      (currentViewMode === 'table') ? document.getElementById('graph-table-view') : 
-                      document.getElementById('graph-timeline-view');
+    const container = (currentViewMode === 'graph')
+        ? document.getElementById('graph-container')
+        : document.getElementById('graph-timeline-view');
                       
     if (!container) return;
     
@@ -324,18 +321,15 @@ function switchGraphView(mode) {
     
     // Toggle active button
     if(mode === 'graph') document.getElementById('btn-view-graph').classList.add('active');
-    if(mode === 'table') document.getElementById('btn-view-table').classList.add('active');
     if(mode === 'timeline') document.getElementById('btn-view-timeline').classList.add('active');
     
     const graphEl = document.getElementById('graph-container');
-    const tableEl = document.getElementById('graph-table-view');
     const timelineEl = document.getElementById('graph-timeline-view');
     const legend = document.getElementById('graph-legend');
     const sidebar = document.getElementById('graph-entity-sidebar');
     const resetBtn = document.getElementById('btn-reset-zoom'); 
 
     if(graphEl) graphEl.style.display = 'none';
-    if(tableEl) tableEl.style.display = 'none';
     if(timelineEl) timelineEl.style.display = 'none';
     if(legend) legend.style.display = 'none';
     if(sidebar) sidebar.style.display = 'none';
@@ -350,39 +344,11 @@ function switchGraphView(mode) {
         if(graphSimulation) graphSimulation.alpha(0.3).restart();
     } else {
         if(resetBtn) resetBtn.style.display = 'none'; 
-        if (mode === 'table') {
-            if(tableEl) { tableEl.style.display = 'block'; renderTableView(); }
-        } else if (mode === 'timeline') {
-            if(timelineEl) { timelineEl.style.display = 'block'; renderTimelineView(); }
-        }
+        if(timelineEl) { timelineEl.style.display = 'block'; renderTimelineView(); }
     }
-}
-
-function renderTableView() {
-    const container = document.getElementById('graph-table-view');
-    if (!container) return;
-    if (!processedNodes || processedNodes.length === 0) {
-        container.innerHTML = '<div style="color:#444; text-align:center; padding-top:100px; font-family:monospace">NO DATA STREAM</div>';
-        return;
-    }
-    const sorted = [...processedNodes].sort((a,b) => (b.date || "").localeCompare(a.date || ""));
-    const rows = sorted.map(d => {
-        let textContent = (typeof marked !== 'undefined') ? marked.parse(d.fullText) : d.fullText;
-        let tagsHtml = d.entities ? d.entities.split(',').map(e => `<span class="meta-tag" style="color:${d.color}; border-color:${d.color}">${e.trim()}</span>`).join('') : "";
-        
-        // Serialize for click handler
-        const dStr = encodeURIComponent(JSON.stringify(d));
-        
-        return `<div class="memory-row" onclick="window.showNodeDetailsFromStr('${dStr}')">
-            <div class="detail-content">${textContent}</div>
-            <div class="memory-meta">${tagsHtml}<span class="meta-date">${d.date ? d.date.substring(0,10) : "UNDATED"}</span></div>
-        </div>`;
-    }).join('');
-    container.innerHTML = `<div class="table-inner-container">${rows}</div>`;
 }
 
 function renderTimelineView() {
-    // Similar logic to table, just different HTML structure
     const container = document.getElementById('graph-timeline-view');
     if (!container) return;
     if (!processedNodes || processedNodes.length === 0) { 
@@ -423,6 +389,22 @@ function renderTimelineView() {
     });
     html += `</div></div>`;
     container.innerHTML = html;
+
+    const timelineItems = container.querySelectorAll('.timeline-item');
+    timelineItems.forEach((item) => {
+        item.addEventListener('mouseenter', () => {
+            container.classList.add('timeline-hovering');
+            timelineItems.forEach((other) => other.classList.remove('timeline-item-active'));
+            item.classList.add('timeline-item-active');
+        });
+
+        item.addEventListener('mouseleave', () => {
+            item.classList.remove('timeline-item-active');
+            if (!container.querySelector('.timeline-item-active')) {
+                container.classList.remove('timeline-hovering');
+            }
+        });
+    });
 }
 
 // --- Detail Panel Logic ---
@@ -445,12 +427,12 @@ function showNodeDetails(d) {
         <div class="detail-content">${contentHtml}</div>
         
         <div class="detail-header" style="color:${panelColor}">Metadata</div>
-        <div style="font-size:0.75em; color:#555; font-family:'Roboto Mono', monospace; margin-bottom: 20px;">
+        <div class="detail-meta" style="font-size:0.75em; color:#555; font-family:'Roboto Mono', monospace; margin-bottom: 20px;">
             <div style="margin-bottom: 8px;">ID: <span style="color:${panelColor}">${d.id.substring(0,8)}</span>...</div>
             <div>TAGS: <span style="color:${panelColor}">${d.entities || "N/A"}</span></div>
         </div>
 
-        <div style="margin-top: auto; padding-top: 20px; border-top: 1px solid #1f2933;">
+        <div class="detail-actions" style="margin-top: auto; padding-top: 20px; border-top: 1px solid #1f2933;">
             <button id="btn-delete-memory" class="btn btn-delete full-width-btn" style="justify-content:center; color: #ef5350; border-color: #ef5350;">
                 <span class="material-symbols-outlined" style="font-size:16px">delete</span> DELETE MEMORY
             </button>
@@ -460,7 +442,7 @@ function showNodeDetails(d) {
     document.getElementById('btn-delete-memory').onclick = () => deleteGraphMemory(d.id);
 }
 
-// Expose helper for the Table/Timeline HTML onclick attributes
+// Expose helper for timeline HTML onclick attributes
 window.showNodeDetailsFromStr = (dStr) => {
     const d = JSON.parse(decodeURIComponent(dStr));
     showNodeDetails(d);

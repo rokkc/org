@@ -17,11 +17,11 @@
 <body>
 
     <div id="sidebar">
-        <div class="sidebar-icon active-icon" onclick="loadPage('notes-page', this)" title="Data Input"><span class="material-symbols-outlined">edit_note</span></div>
-        <div class="sidebar-icon" onclick="loadPage('graph-page', this)" title="Graph View"><span class="material-symbols-outlined">hub</span></div>
-        <div class="sidebar-icon" onclick="loadPage('llm-page', this)" title="LLM Chat"><span class="material-symbols-outlined">smart_toy</span></div>
-        <div class="sidebar-icon" onclick="loadPage('insights-page', this)" title="Insights & Dashboards"><span class="material-symbols-outlined">insights</span></div>
-        <div class="sidebar-icon" onclick="loadPage('settings-page', this)" title="Settings"><span class="material-symbols-outlined">settings</span></div>
+        <div class="sidebar-icon active-icon" data-page="notes-page" onclick="loadPage('notes-page', this)" title="Data Input"><span class="material-symbols-outlined">edit_note</span></div>
+        <div class="sidebar-icon" data-page="graph-page" onclick="loadPage('graph-page', this)" title="Graph View"><span class="material-symbols-outlined">hub</span></div>
+        <div class="sidebar-icon" data-page="llm-page" onclick="loadPage('llm-page', this)" title="LLM Chat"><span class="material-symbols-outlined">smart_toy</span></div>
+        <div class="sidebar-icon" data-page="insights-page" onclick="loadPage('insights-page', this)" title="Insights & Dashboards"><span class="material-symbols-outlined">insights</span></div>
+        <div class="sidebar-icon" data-page="settings-page" onclick="loadPage('settings-page', this)" title="Settings"><span class="material-symbols-outlined">settings</span></div>
     </div>
 
     <div id="mention-popup"></div>
@@ -30,8 +30,7 @@
         <div id="notes-topbar">
             <div class="tab-btn active-tab" onclick="switchSection('People', this)">People</div>
             <div class="tab-btn" onclick="switchSection('Groups', this)">Groups</div>
-            <div class="tab-btn" onclick="switchSection('Items', this)">Items</div>
-            <div class="tab-btn" onclick="switchSection('General', this)">General</div>
+            <div class="tab-btn" onclick="switchSection('Notes', this)">Notes</div>
             <div class="tab-btn" onclick="switchSection('Me', this)">Me</div>
         </div>
         
@@ -76,7 +75,6 @@
                     <div class="input-group"><label class="input-label">First Name</label><input id="me-first" class="clean-input" type="text" placeholder="Your Name"></div>
                     <div class="input-group"><label class="input-label">Last Name</label><input id="me-last" class="clean-input" type="text" placeholder="Your Last Name"></div>
                     <div class="input-group"><label class="input-label">Nickname</label><input id="me-nickname" class="clean-input" type="text" placeholder="Optional"></div>
-                    <div class="input-group"><label class="input-label">Phone</label><input id="me-phone" class="clean-input" type="text"></div>
                     <div class="input-group">
                         <label class="input-label">Birthday</label>
                         <div class="date-input-group">
@@ -91,10 +89,13 @@
                             <input id="me-bday-year" class="clean-input" type="number" placeholder="Year" min="1900" max="2100">
                         </div>
                     </div>
-                    <div class="input-group"><label class="input-label">LinkedIn</label><input id="me-linkedin" class="clean-input" type="text"></div>
-                    <div class="input-group"><label class="input-label">Instagram</label><input id="me-insta" class="clean-input" type="text"></div>
-                    <div class="input-group"><label class="input-label">X (Twitter)</label><input id="me-x" class="clean-input" type="text"></div>
-                    <div class="input-group"><label class="input-label">Discord</label><input id="me-discord" class="clean-input" type="text"></div>
+                    <div class="input-group" style="grid-column: span 2;">
+                        <label class="input-label">Custom Fields</label>
+                        <div id="me-custom-fields" class="kv-fields"></div>
+                        <button class="btn btn-delete kv-add-btn" type="button" onclick="addKeyValueField('me-custom-fields')">
+                            <span class="material-symbols-outlined" style="font-size:16px">add</span> Add Field
+                        </button>
+                    </div>
                 </div>
                 <div class="input-group">
                     <label class="input-label" style="margin-bottom:5px">Bio / Personal Context</label>
@@ -135,43 +136,7 @@
             </div>
 
             <div class="settings-card">
-                <div class="card-header"><span class="material-symbols-outlined">visibility</span> Field Visibility</div>
-                <div class="settings-desc" style="margin-bottom: 20px; padding: 0 15px;">
-                    Toggle metadata fields for the People editor. Hidden fields are preserved in the database but removed from the UI.
-                </div>
-                <div class="settings-grid-row">
-                    <div class="setting-item">
-                        <div class="setting-info"><div class="setting-name">LinkedIn</div></div>
-                        <label class="toggle-switch"><input type="checkbox" id="toggle-linkedin" onchange="toggleField('linkedin', this.checked)"><span class="slider"></span></label>
-                    </div>
-                    <div class="setting-item">
-                        <div class="setting-info"><div class="setting-name">Instagram</div></div>
-                        <label class="toggle-switch"><input type="checkbox" id="toggle-instagram" onchange="toggleField('instagram', this.checked)"><span class="slider"></span></label>
-                    </div>
-                    <div class="setting-item">
-                        <div class="setting-info"><div class="setting-name">X (Twitter)</div></div>
-                        <label class="toggle-switch"><input type="checkbox" id="toggle-x" onchange="toggleField('twitter', this.checked)"><span class="slider"></span></label>
-                    </div>
-                    <div class="setting-item">
-                        <div class="setting-info"><div class="setting-name">Discord</div></div>
-                        <label class="toggle-switch"><input type="checkbox" id="toggle-discord" onchange="toggleField('discord', this.checked)"><span class="slider"></span></label>
-                    </div>
-                </div>
-            </div>
-
-            <div class="settings-card">
                 <div class="card-header"><span class="material-symbols-outlined">palette</span> Interface</div>
-                
-                <div class="setting-item-row">
-                    <div class="setting-info">
-                        <div class="setting-name">Accent Color</div>
-                        <div class="setting-sub">System highlight color.</div>
-                    </div>
-                    <div class="color-picker-wrapper">
-                        <input type="color" id="accent-picker" value="#EAEAEA" onchange="updateAccent(this.value)">
-                        <span class="material-symbols-outlined picker-icon">colorize</span>
-                    </div>
-                </div>
 
                 <div class="setting-item-row">
                     <div class="setting-info">
@@ -199,7 +164,7 @@
                 <div class="setting-item-row">
                     <div class="setting-info">
                         <div class="setting-name">Privacy Mode</div>
-                        <div class="setting-sub">Blur sensitive text in lists.</div>
+                        <div class="setting-sub">Blur sensitive text across CRM, graph, insights, and chat.</div>
                     </div>
                     <label class="toggle-switch">
                         <input type="checkbox" id="blur-toggle" onchange="toggleBlur(this.checked)">

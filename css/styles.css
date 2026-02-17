@@ -141,11 +141,50 @@ body {
     white-space: nowrap; overflow: hidden; text-overflow: ellipsis; pointer-events: none;
 }
 
-/* BLUR MODE */
-.blur-mode .card-title, .blur-mode .ql-editor p, .blur-mode .ql-editor h1, .blur-mode .ql-editor h2, .blur-mode .ql-editor li, .blur-mode .insight-item span:first-child { 
-    filter: blur(5px); transition: filter 0.3s ease;
+/* PRIVACY MODE */
+.blur-mode .card-title,
+.blur-mode #edit-title-input:not(:focus),
+.blur-mode .clean-input:not(:focus),
+.blur-mode .member-name,
+.blur-mode .ql-editor,
+.blur-mode .insight-item span:first-child,
+.blur-mode .mention-option,
+.blur-mode #chat-history .chat-message,
+.blur-mode #chat-input:not(:focus),
+.blur-mode #graph-entity-sidebar .entity-pill span,
+.blur-mode #graph-timeline-view .timeline-card,
+.blur-mode #graph-details-panel .detail-content,
+.blur-mode #graph-details-panel .detail-meta {
+    filter: blur(5px);
+    transition: filter 0.25s ease;
 }
-.blur-mode .card:hover .card-title, .blur-mode .ql-editor:hover *, .blur-mode .insight-item:hover span { filter: none; }
+
+.blur-mode #graph-container .nodes text {
+    opacity: 0.08;
+    transition: opacity 0.25s ease;
+}
+
+.blur-mode .card:hover .card-title,
+.blur-mode #edit-title-input:focus,
+.blur-mode .clean-input:focus,
+.blur-mode .member-item:hover .member-name,
+.blur-mode .ql-editor:hover,
+.blur-mode .ql-editor:focus-within,
+.blur-mode .insight-item:hover span:first-child,
+.blur-mode .mention-option:hover,
+.blur-mode #chat-history .chat-message:hover,
+.blur-mode #chat-input:focus,
+.blur-mode #graph-entity-sidebar .entity-pill:hover span,
+.blur-mode #graph-timeline-view .timeline-card:hover,
+.blur-mode #graph-details-panel:hover .detail-content,
+.blur-mode #graph-details-panel:hover .detail-meta {
+    filter: none;
+}
+
+.blur-mode #graph-container .nodes g:hover text,
+.blur-mode #graph-container .nodes g.node-highlight text {
+    opacity: 1;
+}
 
 /* EDITOR PANE */
 #editor-pane { flex: 1; background: var(--bg-panel); display: flex; flex-direction: column; position: relative; overflow: hidden; }
@@ -175,6 +214,40 @@ body {
 .date-input-group { display: flex; gap: 8px; }
 .date-input-group select { flex: 3; } 
 .date-input-group input[type="number"] { flex: 2; }
+
+/* KEY/VALUE FIELDS */
+.kv-fields {
+    display: flex;
+    flex-direction: column;
+    gap: 8px;
+}
+.kv-row {
+    display: grid;
+    grid-template-columns: 1fr 1fr auto;
+    gap: 8px;
+}
+.kv-remove-btn {
+    width: 36px;
+    height: 36px;
+    background: transparent;
+    border: 1px solid var(--border-subtle);
+    color: var(--text-dim);
+    cursor: pointer;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    transition: 0.2s;
+}
+.kv-remove-btn:hover {
+    border-color: var(--danger);
+    color: var(--danger);
+}
+.kv-add-btn {
+    margin-top: 10px;
+    align-self: flex-start;
+    height: 32px;
+    padding: 0 14px;
+}
 
 /* DROPDOWN FIX */
 select.clean-input {
@@ -472,44 +545,7 @@ select.clean-input {
 }
 .close-panel-btn:hover { color: var(--accent); border-color: var(--accent); background: rgba(0, 188, 212, 0.1); }
 
-/* 7. TABLE VIEW */
-#graph-table-view {
-    display: none; width: 100%; height: 100%; overflow-y: auto;
-    padding-top: 80px; 
-}
-.table-inner-container { 
-    max-width: 1000px; margin: 0 auto; padding: 0 40px 60px 40px; 
-}
-.memory-row {
-    border-bottom: 1px solid #1f2933; padding: 20px 20px; margin-bottom: 0; 
-    transition: 0.2s; cursor: pointer;
-    border-left: 2px solid transparent;
-    display: flex; flex-direction: column; gap: 8px;
-    position: relative;
-    padding-right: 20px; 
-}
-.memory-row:hover { 
-    background: #0b0c0e; 
-    border-left-color: var(--accent);
-}
-.memory-row:hover .detail-content { color: #eee; }
-
-.memory-meta { 
-    display: flex; gap: 10px; align-items: center; 
-    width: 100%;
-}
-.meta-tag { 
-    background: transparent; color: var(--accent); border: 1px solid #1f2933;
-    padding: 3px 8px; border-radius: 0px; font-size: 0.65em; 
-    font-family: 'Roboto Mono', monospace; text-transform: uppercase; letter-spacing: 0.5px;
-}
-.meta-date { 
-    color: #555; font-size: 0.75em; margin-left: auto; 
-    font-family: 'Roboto Mono', monospace; 
-    padding-right: 5px; 
-}
-
-/* 8. TIMELINE VIEW */
+/* 7. TIMELINE VIEW */
 #graph-timeline-view {
     display: none; width: 100%; height: 100%; overflow-y: auto; padding-top: 100px;
 }
@@ -540,6 +576,33 @@ select.clean-input {
     box-shadow: 0 0 15px rgba(0,0,0,0.5);
 }
 .timeline-date-sub { font-size: 0.7em; color: #555; margin-bottom: 8px; text-transform: uppercase; font-weight: 700; letter-spacing: 1px; }
+
+#graph-timeline-view.timeline-hovering .timeline-item {
+    opacity: 0.45;
+}
+#graph-timeline-view.timeline-hovering .timeline-item.timeline-item-active {
+    opacity: 1;
+}
+.timeline-item {
+    transition: transform 0.2s ease, opacity 0.2s ease;
+}
+.timeline-item.timeline-item-active {
+    transform: translateX(8px);
+}
+.timeline-item.timeline-item-active .timeline-card {
+    border-color: var(--accent);
+    background: rgba(0, 188, 212, 0.07);
+    box-shadow: 0 0 18px rgba(0, 188, 212, 0.2);
+}
+.timeline-item.timeline-item-active .timeline-dot {
+    transform: rotate(45deg) scale(1.35);
+    box-shadow: 0 0 14px var(--accent);
+}
+.meta-tag { 
+    background: transparent; color: var(--accent); border: 1px solid #1f2933;
+    padding: 3px 8px; border-radius: 0px; font-size: 0.65em; 
+    font-family: 'Roboto Mono', monospace; text-transform: uppercase; letter-spacing: 0.5px;
+}
 
 /* 9. LLM CHAT PAGE */
 #llm-page {
@@ -723,9 +786,22 @@ select.clean-input {
 /* -- STANDARD ROW -- */
 .setting-item-row {
     display: flex; justify-content: space-between; align-items: center;
+    gap: 16px;
     padding: 20px; border-bottom: 1px solid var(--border-subtle);
 }
 .setting-action-row { padding: 15px 20px; }
+.setting-item-row .setting-info {
+    flex: 1;
+    min-width: 0;
+}
+.setting-item-row .setting-sub {
+    overflow-wrap: anywhere;
+}
+.setting-item-row .toggle-switch,
+.setting-item-row .tech-select,
+.setting-item-row .btn {
+    flex-shrink: 0;
+}
 
 .setting-info { display: flex; flex-direction: column; gap: 4px; }
 .setting-name { font-size: 0.9em; font-weight: 600; color: var(--text-main); }
