@@ -77,6 +77,70 @@ function normalizeExtraFields(source = {}) {
     return normalized;
 }
 
+function normalizeTagList(value) {
+    const input = Array.isArray(value) ? value.join(',') : String(value || '');
+    const seen = new Set();
+    const tags = [];
+
+    input
+        .split(',')
+        .map((tag) => tag.trim().toLowerCase())
+        .filter(Boolean)
+        .forEach((tag) => {
+            if (!seen.has(tag)) {
+                seen.add(tag);
+                tags.push(tag);
+            }
+        });
+
+    return tags;
+}
+
+function extractHashtags(value = '') {
+    const matches = String(value).match(/#([a-zA-Z0-9_-]{2,40})/g) || [];
+    return normalizeTagList(matches.map((entry) => entry.slice(1)));
+}
+
+function cleanTagValues(values = []) {
+    const out = [];
+    const seen = new Set();
+
+    values.forEach((value) => {
+        const tag = String(value || '').trim().toLowerCase();
+        if (!tag) return;
+        if (['none', 'null', 'n/a', 'unknown', 'undefined'].includes(tag)) return;
+        if (seen.has(tag)) return;
+        seen.add(tag);
+        out.push(tag);
+    });
+
+    return out;
+}
+
+function escapeHtml(value = '') {
+    return String(value)
+        .replace(/&/g, '&amp;')
+        .replace(/</g, '&lt;')
+        .replace(/>/g, '&gt;')
+        .replace(/"/g, '&quot;')
+        .replace(/'/g, '&#39;');
+}
+
+function syncKeyValueFieldRemoveButtons(containerEl) {
+    if (!containerEl) return;
+    const rows = containerEl.querySelectorAll('.kv-row');
+    const hideRemove = rows.length <= 1;
+
+    rows.forEach((row) => {
+        const btn = row.querySelector('.kv-remove-btn');
+        if (!btn) return;
+        row.style.gridTemplateColumns = hideRemove ? '1fr 1fr' : '1fr 1fr auto';
+        btn.style.display = hideRemove ? 'none' : 'flex';
+        btn.setAttribute('aria-hidden', hideRemove ? 'true' : 'false');
+        btn.tabIndex = hideRemove ? -1 : 0;
+    });
+}
+
 function addKeyValueFieldInternal(containerId, key = '', value = '') {
     const container = document.getElementById(containerId);
     if (!container) return;
@@ -106,6 +170,7 @@ function addKeyValueFieldInternal(containerId, key = '', value = '') {
     row.appendChild(valueInput);
     row.appendChild(removeBtn);
     container.appendChild(row);
+    syncKeyValueFieldRemoveButtons(container);
 }
 
 function renderKeyValueFields(containerId, pairs = []) {
@@ -115,6 +180,7 @@ function renderKeyValueFields(containerId, pairs = []) {
     container.innerHTML = '';
     const data = pairs.length ? pairs : [{ key: '', value: '' }];
     data.forEach((pair) => addKeyValueFieldInternal(containerId, pair.key || '', pair.value || ''));
+    syncKeyValueFieldRemoveButtons(container);
 }
 
 function readKeyValueFields(containerId) {
@@ -133,6 +199,7 @@ function readKeyValueFields(containerId) {
 
 window.addKeyValueField = function(containerId) {
     addKeyValueFieldInternal(containerId);
+    syncKeyValueFieldRemoveButtons(document.getElementById(containerId));
 };
 
 window.removeKeyValueField = function(buttonEl) {
@@ -140,11 +207,50 @@ window.removeKeyValueField = function(buttonEl) {
     const container = row?.parentElement;
     if (!row || !container) return;
 
+    if (container.querySelectorAll('.kv-row').length <= 1) {
+        syncKeyValueFieldRemoveButtons(container);
+        return;
+    }
+
     row.remove();
     if (!container.querySelector('.kv-row')) {
         addKeyValueFieldInternal(container.id);
     }
+    syncKeyValueFieldRemoveButtons(container);
 };
+
+function renderGroupMemberRows(people = []) {
+    if (!Array.isArray(people) || people.length === 0) {
+        return '<div class="member-empty">No people found.</div>';
+    }
+
+    return people.map((person) => {
+        const fullName = `${person.firstName || ''} ${person.lastName || ''}`.trim() || 'Untitled Person';
+        return `
+            <label class="member-item" data-member-label="${escapeHtml(fullName.toLowerCase())}">
+                <input type="checkbox" class="group-member-checkbox" value="${escapeHtml(person.id)}">
+                <span class="member-name">${escapeHtml(fullName)}</span>
+            </label>
+        `;
+    }).join('');
+}
+
+function filterGroupMemberRows(term = '') {
+    const normalized = String(term || '').trim().toLowerCase();
+    document.querySelectorAll('.member-item[data-member-label]').forEach((row) => {
+        const label = row.dataset.memberLabel || '';
+        row.style.display = label.includes(normalized) ? 'flex' : 'none';
+    });
+}
+
+function bindGroupMemberSearch() {
+    const searchInput = document.getElementById('group-member-search');
+    if (!searchInput) return;
+
+    searchInput.addEventListener('input', (event) => {
+        filterGroupMemberRows(event.target.value);
+    });
+}
 
 // --- GLOBAL HELPERS (Attached to Window for HTML onclick access) ---
 
@@ -175,14 +281,6 @@ window.renderList = function() {
         });
     }
 
-    if (appSettings.sortOrder === 'alpha') {
-        items.sort((a, b) => {
-            const nameA = (a.firstName || a.name || a.title || "").toLowerCase();
-            const nameB = (b.firstName || b.name || b.title || "").toLowerCase();
-            return nameA.localeCompare(nameB);
-        });
-    }
-
     if (items.length === 0) {
         container.innerHTML = `<div style="text-align:center; padding: 20px; color: var(--text-dim); font-size:12px;">${searchQuery ? 'No matches' : 'No items'}</div>`;
         return;
@@ -205,25 +303,29 @@ window.renderList = function() {
 
 // --- Initialization ---
 document.addEventListener('DOMContentLoaded', () => {
-    loadSettings();
-    initEditors();
+    try {
+        loadSettings();
+        initEditors();
 
-    const searchInput = document.getElementById('search-input');
-    if (searchInput) {
-        searchInput.addEventListener('input', (e) => {
-            searchQuery = e.target.value.toLowerCase();
-            window.renderList();
+        const searchInput = document.getElementById('search-input');
+        if (searchInput) {
+            searchInput.addEventListener('input', (e) => {
+                searchQuery = e.target.value.toLowerCase();
+                window.renderList();
+            });
+        }
+
+        window.addEventListener('popstate', () => {
+            const pageId = getPageFromUrl();
+            window.loadPage(pageId, getSidebarIcon(pageId), { skipHistory: true });
         });
+
+        const initialPageId = getPageFromUrl();
+        window.renderList();
+        window.loadPage(initialPageId, getSidebarIcon(initialPageId), { replaceHistory: true });
+    } finally {
+        document.body.classList.remove('app-init');
     }
-
-    window.addEventListener('popstate', () => {
-        const pageId = getPageFromUrl();
-        window.loadPage(pageId, getSidebarIcon(pageId), { skipHistory: true });
-    });
-
-    const initialPageId = getPageFromUrl();
-    window.renderList();
-    window.loadPage(initialPageId, getSidebarIcon(initialPageId), { replaceHistory: true });
 });
 
 // --- GLOBAL NAVIGATION ---
@@ -329,6 +431,7 @@ window.loadItemIntoEditor = function(id) {
             const cb = document.querySelector(`.group-member-checkbox[value="${mId}"]`);
             if(cb) cb.checked = true;
         });
+        filterGroupMemberRows(document.getElementById('group-member-search')?.value || '');
         quill.root.innerHTML = item.description || '';
     } else {
         document.getElementById('edit-title-input').value = item.title || "";
@@ -371,13 +474,16 @@ function setupFormFields() {
         if (activeSection === 'Groups') {
             titleInput.placeholder = "Group Name";
             const data = getStoredData();
-            let membersHtml = (data.People || []).map((p) => `
-                <label class="member-item" style="display:flex; align-items:center; gap:8px; margin-bottom:5px;">
-                    <input type="checkbox" class="group-member-checkbox" value="${p.id}">
-                    <span class="member-name">${p.firstName} ${p.lastName}</span>
-                </label>`).join('');
-            if(!membersHtml) membersHtml = '<div style="padding:10px; color:var(--text-dim); font-size:0.8em">No people found.</div>';
-            container.innerHTML = `<div class="input-group" style="grid-column: span 2"><label class="input-label">Add People</label><div class="member-list-container" style="max-height:100px; overflow-y:auto; border:1px solid var(--border-subtle); padding:10px;">${membersHtml}</div></div>`;
+            const membersHtml = renderGroupMemberRows(data.People || []);
+            container.innerHTML = `
+                <div class="input-group group-members-group" style="grid-column: span 2">
+                    <label class="input-label">Add People</label>
+                    <input id="group-member-search" class="clean-input group-member-search" type="text" placeholder="Search people...">
+                    <div class="member-list-container">${membersHtml}</div>
+                </div>
+            `;
+            bindGroupMemberSearch();
+            filterGroupMemberRows('');
         } else {
             titleInput.placeholder = "Note Title";
             container.innerHTML = '';
@@ -392,7 +498,7 @@ window.createNewItem = function() {
     document.getElementById('editor-form').style.display = 'flex';
     setupFormFields();
     document.getElementById('edit-title-input').value = '';
-    document.querySelectorAll('.clean-input').forEach((i) => { i.value = ''; });
+    document.querySelectorAll('#editor-form .clean-input').forEach((i) => { i.value = ''; });
     quill.setText('');
 
     if (activeSection === 'People') {
@@ -454,20 +560,41 @@ window.handleSave = function() {
     data[activeSection].unshift(newItem);
     saveStoredData(data);
 
-    if (activeSection === 'People' || activeSection === 'Groups') {
+    if (activeSection === 'People' || activeSection === 'Groups' || activeSection === 'Notes') {
         let content = "";
+        let context = activeSection.toLowerCase();
         const meta = { source: 'Organizer App', type: activeSection.toLowerCase() };
+        const tags = [`section:${activeSection.toLowerCase()}`];
 
         if (activeSection === 'People') {
             const name = `${newItem.firstName} ${newItem.lastName}`.trim();
             const extra = (newItem.extraFields || []).map((f) => `${f.key}: ${f.value}`).join('\n') || 'N/A';
             content = `PERSON PROFILE: ${name}\nNickname: ${newItem.nickname || 'N/A'}\nBirthday: ${newItem.birthday || 'N/A'}\nCustom Fields:\n${extra}\nBio/Notes:\n${newItem.notes || ''}`;
+            context = 'person_profile';
             meta.name = name;
-        } else {
+            tags.push(`person:${newItem.id}`);
+        } else if (activeSection === 'Groups') {
             content = `GROUP: ${newItem.name}\nDescription:\n${newItem.description || ''}`;
+            context = 'group_profile';
             meta.name = newItem.name;
+            tags.push(`group:${newItem.id}`);
+        } else {
+            content = `NOTE: ${newItem.title || 'Untitled Note'}\n${newItem.body || ''}`;
+            context = 'note';
+            meta.title = newItem.title || 'Untitled Note';
+            tags.push(`note:${newItem.id}`);
         }
-        hindsight.syncDocument(newItem.id, content, meta);
+
+        const hashTags = extractHashtags(content);
+        const mergedTags = cleanTagValues([...tags, ...hashTags]);
+
+        hindsight.syncDocument(newItem.id, content, {
+            metadata: meta,
+            timestamp: newItem.lastEdited,
+            context,
+            tags: mergedTags,
+            documentTags: mergedTags
+        });
     }
 
     window.renderList();
@@ -479,7 +606,9 @@ window.handleSave = function() {
 
 window.handleDelete = function() {
     if(!currentItemId || !confirm("Delete this item permanently?")) return;
-    if (activeSection === 'People' || activeSection === 'Groups') hindsight.deleteDocument(currentItemId);
+    if (activeSection === 'People' || activeSection === 'Groups' || activeSection === 'Notes') {
+        hindsight.deleteDocument(currentItemId);
+    }
 
     const data = getStoredData();
     data[activeSection] = (data[activeSection] || []).filter((i) => i.id !== currentItemId);
@@ -489,8 +618,42 @@ window.handleDelete = function() {
     window.renderList();
 };
 
-window.updateFontSize = function(val) { appSettings.fontSize = val; saveSettings(); };
-window.updateSortOrder = function(val) { appSettings.sortOrder = val; saveSettings(); window.renderList(); };
+window.updateUIDensity = function(val) {
+    appSettings.uiDensity = ['compact', 'default', 'spacious'].includes(val) ? val : 'default';
+    saveSettings();
+};
+window.updateGraphSpacing = function(val) {
+    const numeric = Number(val);
+    appSettings.graphSpacing = Number.isFinite(numeric)
+        ? Math.min(260, Math.max(40, Math.round(numeric)))
+        : 100;
+    saveSettings();
+
+    const graphPage = document.getElementById('graph-page');
+    if (graphPage && graphPage.classList.contains('active-page') && typeof window.refreshGraphData === 'function') {
+        window.refreshGraphData();
+    }
+};
+window.previewGraphSpacing = function(val) {
+    const label = document.getElementById('graph-spacing-value');
+    if (!label) return;
+
+    const numeric = Number(val);
+    if (!Number.isFinite(numeric)) return;
+    label.textContent = `${Math.min(260, Math.max(40, Math.round(numeric)))}%`;
+};
+window.updateReasoningBudget = function(val) {
+    appSettings.reasoningBudget = ['low', 'mid', 'high'].includes(val) ? val : 'mid';
+    saveSettings();
+};
+window.toggleAgentReflect = function(checked) {
+    appSettings.agentUseReflect = !!checked;
+    saveSettings();
+};
+window.toggleAgentMemorySave = function(checked) {
+    appSettings.agentSaveConversation = !!checked;
+    saveSettings();
+};
 window.toggleBlur = function(checked) { appSettings.blurMode = checked; saveSettings(); };
 window.resetAppearance = function() {
     if(!confirm("Reset visual settings?")) return;
@@ -542,15 +705,56 @@ function loadMeData() {
 }
 
 window.saveMeData = function() {
+    const firstName = document.getElementById('me-first').value.trim();
+    const lastName = document.getElementById('me-last').value.trim();
+    const nickname = document.getElementById('me-nickname').value.trim();
+    const birthday = getDateString('me-bday-month', 'me-bday-day', 'me-bday-year');
+    const extraFields = readKeyValueFields('me-custom-fields');
+    const bio = quillMe.root.innerHTML;
+    const lastEdited = new Date().toISOString();
+
     const meData = {
-        firstName: document.getElementById('me-first').value,
-        lastName: document.getElementById('me-last').value,
-        nickname: document.getElementById('me-nickname').value,
-        birthday: getDateString('me-bday-month', 'me-bday-day', 'me-bday-year'),
-        extraFields: readKeyValueFields('me-custom-fields'),
-        bio: quillMe.root.innerHTML
+        firstName,
+        lastName,
+        nickname,
+        birthday,
+        extraFields,
+        bio,
+        lastEdited
     };
     localStorage.setItem('organizer-me', JSON.stringify(meData));
+
+    const fullName = `${firstName} ${lastName}`.trim();
+    const extras = extraFields.map((field) => `${field.key}: ${field.value}`).join('\n') || 'N/A';
+    const profileContent = [
+        `ME PROFILE: ${fullName || 'User'}`,
+        `Nickname: ${nickname || 'N/A'}`,
+        `Birthday: ${birthday || 'N/A'}`,
+        'Custom Fields:',
+        extras,
+        'Bio / Context:',
+        bio || 'N/A'
+    ].join('\n');
+
+    const meTags = cleanTagValues([
+        'section:me',
+        'profile:self',
+        'entity:user',
+        ...extractHashtags(profileContent)
+    ]);
+
+    hindsight.syncDocument('me-profile', profileContent, {
+        metadata: {
+            source: 'Organizer App',
+            type: 'me',
+            name: fullName || 'User'
+        },
+        timestamp: lastEdited,
+        context: 'me_profile',
+        tags: meTags,
+        documentTags: meTags
+    });
+
     const btn = document.querySelector('#me-view .btn-save');
     const originalText = btn.innerText;
     btn.innerText = "Saved";

@@ -14,10 +14,10 @@
     <script src="https://cdn.jsdelivr.net/npm/marked/marked.min.js"></script>
     <script src="https://d3js.org/d3.v7.min.js"></script>
 </head>
-<body>
+<body class="app-init">
 
     <div id="sidebar">
-        <div class="sidebar-icon active-icon" data-page="notes-page" onclick="loadPage('notes-page', this)" title="Data Input"><span class="material-symbols-outlined">edit_note</span></div>
+        <div class="sidebar-icon" data-page="notes-page" onclick="loadPage('notes-page', this)" title="Data Input"><span class="material-symbols-outlined">edit_note</span></div>
         <div class="sidebar-icon" data-page="graph-page" onclick="loadPage('graph-page', this)" title="Graph View"><span class="material-symbols-outlined">hub</span></div>
         <div class="sidebar-icon" data-page="llm-page" onclick="loadPage('llm-page', this)" title="LLM Chat"><span class="material-symbols-outlined">smart_toy</span></div>
         <div class="sidebar-icon" data-page="insights-page" onclick="loadPage('insights-page', this)" title="Insights & Dashboards"><span class="material-symbols-outlined">insights</span></div>
@@ -26,7 +26,7 @@
 
     <div id="mention-popup"></div>
 
-    <div id="notes-page" class="page active-page">
+    <div id="notes-page" class="page">
         <div id="notes-topbar">
             <div class="tab-btn active-tab" onclick="switchSection('People', this)">People</div>
             <div class="tab-btn" onclick="switchSection('Groups', this)">Groups</div>
@@ -122,7 +122,7 @@
     </div>
 
     <div id="insights-page" class="page">
-        <div class="settings-container-width">
+        <div class="insights-container-width">
             <div class="page-header-text">Insights</div>
             <div id="insights-content" class="insights-grid"></div>
         </div>
@@ -140,25 +140,35 @@
 
                 <div class="setting-item-row">
                     <div class="setting-info">
-                        <div class="setting-name">Font Size</div>
-                        <div class="setting-sub">Global text scaling.</div>
+                        <div class="setting-name">UI Density</div>
+                        <div class="setting-sub">Spacing and layout compactness across the app.</div>
                     </div>
-                    <select id="font-size-picker" class="tech-select" onchange="updateFontSize(this.value)">
-                        <option value="12px">Compact (12px)</option>
-                        <option value="14px">Standard (14px)</option>
-                        <option value="16px">Large (16px)</option>
+                    <select id="ui-density-picker" class="tech-select" onchange="updateUIDensity(this.value)">
+                        <option value="compact">Compact</option>
+                        <option value="default">Default</option>
+                        <option value="spacious">Spacious</option>
                     </select>
                 </div>
 
                 <div class="setting-item-row">
                     <div class="setting-info">
-                        <div class="setting-name">Sort Order</div>
-                        <div class="setting-sub">Default list organization.</div>
+                        <div class="setting-name">Graph Spacing</div>
+                        <div class="setting-sub">How tightly memory nodes cluster in network view.</div>
                     </div>
-                    <select id="sort-picker" class="tech-select" onchange="updateSortOrder(this.value)">
-                        <option value="recent">Recent Activity</option>
-                        <option value="alpha">Alphabetical (A-Z)</option>
-                    </select>
+                    <div class="graph-spacing-control">
+                        <input
+                            id="graph-spacing-slider"
+                            class="range-slider graph-spacing-slider"
+                            type="range"
+                            min="40"
+                            max="260"
+                            step="5"
+                            value="100"
+                            oninput="previewGraphSpacing(this.value)"
+                            onchange="updateGraphSpacing(this.value)"
+                        >
+                        <span id="graph-spacing-value" class="graph-spacing-value">100%</span>
+                    </div>
                 </div>
 
                 <div class="setting-item-row">

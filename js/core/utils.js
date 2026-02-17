@@ -49,3 +49,33 @@ export function getDateString(monthId, dayId, yearId) {
     const pad = (n) => n.toString().padStart(2, '0');
     return `${safeYear}-${pad(m)}-${pad(d)}`;
 }
+
+// Basic sanitization layer for rendered HTML content.
+export function sanitizeHtml(rawHtml = '') {
+    if (!rawHtml || typeof rawHtml !== 'string') return '';
+
+    const template = document.createElement('template');
+    template.innerHTML = rawHtml;
+
+    template.content.querySelectorAll('script, style, iframe, object, embed, link, meta').forEach((node) => {
+        node.remove();
+    });
+
+    template.content.querySelectorAll('*').forEach((el) => {
+        Array.from(el.attributes).forEach((attr) => {
+            const name = attr.name.toLowerCase();
+            const value = (attr.value || '').trim().toLowerCase();
+
+            if (name.startsWith('on')) {
+                el.removeAttribute(attr.name);
+                return;
+            }
+
+            if ((name === 'href' || name === 'src') && value.startsWith('javascript:')) {
+                el.removeAttribute(attr.name);
+            }
+        });
+    });
+
+    return template.innerHTML;
+}

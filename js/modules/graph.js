@@ -1,4 +1,6 @@
 import { hindsight } from '../services/hindsight.js';
+import { sanitizeHtml } from '../core/utils.js';
+import { appSettings } from '../core/store.js';
 
 // --- State ---
 let graphSimulation = null;
@@ -11,6 +13,14 @@ let isDragging = false;
 let wasActiveBeforeDrag = false;
 let currentViewMode = 'graph'; 
 
+function stripWhenAndInvolving(raw = '') {
+    return String(raw || '')
+        .replace(/\s*\|\s*(when|involving)\s*:[^|\n]*/gi, '')
+        .replace(/^\s*(when|involving)\s*:[^\n]*\n?/gim, '')
+        .replace(/\n{3,}/g, '\n\n')
+        .trim();
+}
+
 // BATMAN / DETECTIVE PALETTE
 const COLORS = {
     node: "#00bcd4",     // Ice Blue
@@ -20,6 +30,28 @@ const COLORS = {
     activeEdge: "#ff00ff",   // Neon Pink
     bg: "#020202"
 };
+
+function getSpacingFactors() {
+    const raw = Number(appSettings.graphSpacing);
+    const scale = Number.isFinite(raw) ? Math.max(0.4, Math.min(2.6, raw / 100)) : 1;
+
+    return {
+        linkDistance: scale,
+        keyLinkDistance: 0.9 + (scale - 1) * 0.7,
+        charge: 0.75 + (scale * 0.55),
+        isolateCharge: 0.85 + (scale * 0.4),
+        centering: Math.max(0.35, 1.28 - (scale * 0.4)),
+        collision: 0.82 + (scale * 0.34)
+    };
+}
+
+function normalizeEntities(rawEntities = '') {
+    return String(rawEntities || '')
+        .split(',')
+        .map((entry) => entry.trim())
+        .filter(Boolean)
+        .filter((entry) => !['none', 'null', 'n/a', 'undefined', 'unknown'].includes(entry.toLowerCase()));
+}
 
 export function initGraphPage() {
     const page = document.getElementById('graph-page');
@@ -58,13 +90,14 @@ export function initGraphPage() {
                 <div class="legend-item"><div class="legend-dot" style="background:${COLORS.insight}"></div>Insight</div>
                 <div class="legend-header" style="margin-top:15px">Links</div>
                 <div class="legend-item"><div class="legend-line" style="background:${COLORS.keyLink}; box-shadow:0 0 4px ${COLORS.keyLink}"></div>Key Link</div>
+                <div class="legend-item"><div class="legend-line legend-line-dashed" style="border-top-color:${COLORS.standardLink}"></div>Standard Link</div>
                 <div class="legend-item"><div class="legend-line" style="background:${COLORS.activeEdge}"></div>Selected</div>
             </div>
 
             <div id="graph-timeline-view"></div>
             
             <div id="graph-details-panel">
-                <div class="close-panel-btn"><span class="material-symbols-outlined" style="font-size:16px">close</span></div>
+                <button type="button" class="insight-btn graph-close-btn">Close</button>
                 <div style="font-size:0.7em; font-weight:700; margin-bottom:10px; color:#555; text-transform:uppercase; letter-spacing:3px" id="detail-type">DATA</div>
                 <div id="detail-body"></div>
             </div>
@@ -76,7 +109,8 @@ export function initGraphPage() {
         document.getElementById('btn-reset-zoom').onclick = resetGraphZoom;
         document.getElementById('btn-refresh-graph').onclick = refreshGraphData;
         
-        document.querySelector('.close-panel-btn').onclick = closeDetailPanel;
+        const closeBtn = document.querySelector('.graph-close-btn');
+        if (closeBtn) closeBtn.onclick = closeDetailPanel;
         
         document.getElementById('entity-sidebar-search').oninput = (e) => filterEntityList(e.target.value);
     }
@@ -84,12 +118,14 @@ export function initGraphPage() {
     renderGraphView();
 }
 
+window.refreshGraphData = refreshGraphData;
+
 function resetGraphZoom() {
     if (graphSvg && graphZoom) {
         const container = document.getElementById('graph-container');
         const width = container.clientWidth;
         const height = container.clientHeight;
-        const scale = 2; 
+        const scale = 1.5;
         const tx = (width / 2) * (1 - scale);
         const ty = (height / 2) * (1 - scale);
         const transform = d3.zoomIdentity.translate(tx, ty).scale(scale);
@@ -135,23 +171,22 @@ async function renderGraphView() {
         const d = n.data || n;
         let label = d.label || d.text || d.id;
         let type = "Memory";
+        const cleanedText = stripWhenAndInvolving(d.text || d.label);
 
         if (label.startsWith("##")) { label = "Insight"; type = "Insight"; }
         
-        if(d.entities) {
-            d.entities.split(',').forEach(e => {
-                const cleanE = e.trim();
-                if(cleanE) entityCounts.set(cleanE, (entityCounts.get(cleanE) || 0) + 1);
-            });
-        }
+        const entityList = normalizeEntities(d.entities || '');
+        entityList.forEach((entity) => {
+            entityCounts.set(entity, (entityCounts.get(entity) || 0) + 1);
+        });
 
         return { 
             id: d.id, 
             label: label.length > 20 ? label.substring(0, 17) + "..." : label, 
-            fullText: d.text || d.label, 
+            fullText: cleanedText,
             type: type, 
-            entities: d.entities || "", 
-            entityList: d.entities ? d.entities.split(',').map(s=>s.trim()) : [],
+            entities: entityList.join(', '),
+            entityList,
             date: d.date || "", 
             r: type === 'Insight' ? 5 : 4, 
             color: type === 'Insight' ? COLORS.insight : COLORS.node
@@ -164,11 +199,12 @@ async function renderGraphView() {
         let type = (d.linkType || d.relation || "semantic").toLowerCase();
         
         let linkColor = COLORS.standardLink;
-        let linkOpacity = 0.3;
-        let dashed = "3,3"; 
+        let linkOpacity = 0.35;
+        let dashed = "3,3";
         let width = 1;
 
-        if (type === 'causal' || type.includes('entity')) {
+        const isKeyLink = type === 'causal' || type === 'entity' || type.includes('entity');
+        if (isKeyLink) {
             linkColor = COLORS.keyLink; 
             linkOpacity = 0.8;
             width = 1.5;
@@ -181,6 +217,17 @@ async function renderGraphView() {
             originalColor: linkColor 
         };
     });
+
+    // Flag disconnected nodes so we can keep them stable and in-frame.
+    const degree = new Map();
+    processedLinks.forEach((link) => {
+        degree.set(link.source, (degree.get(link.source) || 0) + 1);
+        degree.set(link.target, (degree.get(link.target) || 0) + 1);
+    });
+    processedNodes = processedNodes.map((node) => ({
+        ...node,
+        isIsolated: !degree.has(node.id)
+    }));
 
     // Render Sidebar
     if (entitySidebarList) {
@@ -221,13 +268,28 @@ async function renderGraphView() {
     const g = graphSvg.append("g");
 
     // Initial Zoom
-    const initScale = 2;
+    const initScale = 1.5;
     graphSvg.call(graphZoom.transform, d3.zoomIdentity.translate((width/2)*(1-initScale), (height/2)*(1-initScale)).scale(initScale));
 
+    const spacing = getSpacingFactors();
+
     graphSimulation = d3.forceSimulation(processedNodes)
-        .force("link", d3.forceLink(processedLinks).id(d => d.id).distance(100)) 
-        .force("charge", d3.forceManyBody().strength(-300)) 
-        .force("center", d3.forceCenter(width / 2, height / 2));
+        .force("link", d3.forceLink(processedLinks).id(d => d.id).distance((l) => {
+            const base = (l.type === 'causal' || l.type.includes('entity')) ? 120 : 150;
+            const multiplier = (l.type === 'causal' || l.type.includes('entity'))
+                ? spacing.keyLinkDistance
+                : spacing.linkDistance;
+            return base * multiplier;
+        }).strength(0.26))
+        .force("charge", d3.forceManyBody().strength((d) => {
+            const base = d.isIsolated ? -120 : -360;
+            return base * (d.isIsolated ? spacing.isolateCharge : spacing.charge);
+        }))
+        .force("center", d3.forceCenter(width / 2, height / 2))
+        .force("x", d3.forceX(width / 2).strength((d) => (d.isIsolated ? 0.09 : 0.02) * spacing.centering))
+        .force("y", d3.forceY(height / 2).strength((d) => (d.isIsolated ? 0.09 : 0.02) * spacing.centering))
+        .force("collide", d3.forceCollide().radius((d) => (d.r + 8) * spacing.collision).strength(0.4))
+        .velocityDecay(0.4);
 
     const link = g.append("g").attr("class", "links").selectAll("path")
         .data(processedLinks).enter().append("path")
@@ -260,6 +322,9 @@ async function renderGraphView() {
         });
         node.attr("transform", d => {
             if (isNaN(d.x)) return "";
+            const padding = 24;
+            d.x = Math.max(padding, Math.min(width - padding, d.x));
+            d.y = Math.max(padding, Math.min(height - padding, d.y));
             return `translate(${d.x},${d.y})`;
         });
     });
@@ -372,13 +437,15 @@ function renderTimelineView() {
             currentMonth = monthLabel;
         }
 
-        let textContent = (typeof marked !== 'undefined') ? marked.parse(d.fullText) : d.fullText;
-        let tagsHtml = d.entities ? d.entities.split(',').map(e => `<span class="meta-tag" style="color:${d.color}; border-color:${d.color}">${e.trim()}</span>`).join('') : '';
-
-        const dStr = encodeURIComponent(JSON.stringify(d));
+        const rawTextContent = (typeof marked !== 'undefined') ? marked.parse(d.fullText || '') : (d.fullText || '');
+        const textContent = sanitizeHtml(rawTextContent);
+        const timelineEntities = normalizeEntities(d.entities || '');
+        const tagsHtml = timelineEntities.length
+            ? timelineEntities.map((entity) => `<span class="meta-tag" style="color:${d.color}; border-color:${d.color}">${entity}</span>`).join('')
+            : '';
 
         html += `
-        <div class="timeline-item" onclick="window.showNodeDetailsFromStr('${dStr}')">
+        <div class="timeline-item">
             <div class="timeline-dot" style="border-color:${d.color}; box-shadow:0 0 5px ${d.color}"></div>
             <div class="timeline-card" style="border-color:${d.color}44">
                 <div class="timeline-date-sub">${d.date ? d.date.substring(0,10) : "Unknown Date"}</div>
@@ -391,7 +458,12 @@ function renderTimelineView() {
     container.innerHTML = html;
 
     const timelineItems = container.querySelectorAll('.timeline-item');
-    timelineItems.forEach((item) => {
+    timelineItems.forEach((item, index) => {
+        item.addEventListener('click', () => {
+            const node = sorted[index];
+            if (node) showNodeDetails(node);
+        });
+
         item.addEventListener('mouseenter', () => {
             container.classList.add('timeline-hovering');
             timelineItems.forEach((other) => other.classList.remove('timeline-item-active'));
@@ -420,7 +492,8 @@ function showNodeDetails(d) {
     const panelColor = d.color || COLORS.node;
     panel.style.borderLeftColor = panelColor;
 
-    let contentHtml = (typeof marked !== 'undefined') ? marked.parse(d.fullText) : d.fullText;
+    const rawContentHtml = (typeof marked !== 'undefined') ? marked.parse(d.fullText || '') : (d.fullText || '');
+    const contentHtml = sanitizeHtml(rawContentHtml);
 
     document.getElementById('detail-body').innerHTML = `
         <div class="detail-header" style="color:${panelColor}">Content</div>
@@ -440,12 +513,6 @@ function showNodeDetails(d) {
     `;
     
     document.getElementById('btn-delete-memory').onclick = () => deleteGraphMemory(d.id);
-}
-
-// Expose helper for timeline HTML onclick attributes
-window.showNodeDetailsFromStr = (dStr) => {
-    const d = JSON.parse(decodeURIComponent(dStr));
-    showNodeDetails(d);
 }
 
 async function deleteGraphMemory(id) {
